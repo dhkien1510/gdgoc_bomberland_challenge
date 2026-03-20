@@ -185,9 +185,12 @@ def str2bool(value):
 	raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
 
 
-def make_agents(model_paths):
+def make_agents(model_paths, seed=None):
 	agents = [None] * len(model_paths)
 	names = [None] * len(model_paths)
+
+	if seed is not None:
+		random.seed(seed)
 
 	for i, path in enumerate(model_paths):
 		if path != "None":
@@ -205,14 +208,14 @@ def make_agents(model_paths):
 				names[i] = "SmarterRuleAgent"
 				agents[i] = SmarterRuleAgent(i)
 			elif x == 3:
-				names[i] = "TacticalRuleAgent"
-				agents[i] = TacticalRuleAgent(i)
+				names[i] = "GeniusRuleAgent"
+				agents[i] = GeniusRuleAgent(i)
 			elif x == 4:
 				names[i] = "BoxFarmerAgent"
 				agents[i] = BoxFarmerAgent(i)
 			else:
-				names[i] = "GeniusRuleAgent"
-				agents[i] = GeniusRuleAgent(i)
+				names[i] = "TacticalRuleAgent"
+				agents[i] = TacticalRuleAgent(i)
 
 	return agents, names
 
@@ -227,7 +230,7 @@ def clone_obs(obs):
 
 def simulate_episodes(model_paths, num_episodes=10, max_steps=500, seed=None):
 	env = BomberEnv(max_steps=max_steps)
-	agents, names = make_agents(model_paths)
+	agents, names = make_agents(model_paths, seed=seed)
 	episodes = []
 
 	for episode in range(num_episodes):
