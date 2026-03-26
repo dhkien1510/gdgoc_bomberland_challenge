@@ -79,8 +79,8 @@ class DQNAgent:
         self.lr = 1e-3
         
         # Networks: Q-Network (learning) and Target-Network (stable target)
-        self.q_net = DQNModel(input_dim, num_actions)
-        self.target_net = DQNModel(input_dim, num_actions)
+        self.q_net = DQNModel(input_dim, num_actions).to(device)
+        self.target_net = DQNModel(input_dim, num_actions).to(device)
         self.target_net.load_state_dict(self.q_net.state_dict()) # Sync weights initially
         
         self.optimizer = optim.Adam(self.q_net.parameters(), lr=self.lr, eps=1e-08, weight_decay=1e-5)
