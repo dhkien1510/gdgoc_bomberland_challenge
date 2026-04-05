@@ -26,14 +26,24 @@ from tqdm import tqdm
 
 from engine import BomberEnv
 
-from bomber_shared import (
-    AGENT_LOOKUP,
-    NUM_ACTIONS,
-    _make_agent,
-    collect_demonstrations,
-    encode_obs,
-)
-from reward_02 import EpisodeRewardState, compute_reward_icec
+try:
+    from .bomber_shared import (
+        AGENT_LOOKUP,
+        NUM_ACTIONS,
+        _make_agent,
+        collect_demonstrations,
+        encode_obs,
+    )
+    from .reward_02 import EpisodeRewardState, compute_reward_icec
+except ImportError:
+    from bomber_shared import (
+        AGENT_LOOKUP,
+        NUM_ACTIONS,
+        _make_agent,
+        collect_demonstrations,
+        encode_obs,
+    )
+    from reward_02 import EpisodeRewardState, compute_reward_icec
 
 BC_CLASS_WEIGHTS = torch.tensor([0.3, 1.0, 1.0, 1.0, 1.0, 2.0], dtype=torch.float32)
 
@@ -355,7 +365,12 @@ def train_bc_ppo_lstm(
     prev_l = list(prev_l)
 
     c, hh, ww = map_l[0].shape
-    print(f"Phase 2: PPO+LSTM  device={device}  parallel_envs={n_env}  steps/rollout={ppo_steps}")
+    _epm = max(1, min(n_env, minibatch_size // max(1, ppo_steps)))
+    print(
+        f"Phase 2: PPO+LSTM  device={device}  parallel_envs={n_env}  "
+        f"steps/rollout={ppo_steps}  recurrent_minibatch_envs={_epm} "
+        f"(~{_epm * ppo_steps} transitions per opt step)"
+    )
 
     pbar = tqdm(range(ppo_updates), desc="PPO+LSTM")
     for upd in pbar:
@@ -437,26 +452,56 @@ def train_bc_ppo_lstm(
 
         obs_map_t = torch.from_numpy(stor_m).to(device)
         obs_aux_t = torch.from_numpy(stor_a).to(device)
-        act_flat = torch.from_numpy(stor_act).long().to(device).reshape(-1)
+        act_t = torch.from_numpy(stor_act).long().to(device)
 
-        pi_loss = v_loss = torch.zeros((), device=device)
+        # Recurrent minibatch: slice env columns so each minibatch runs full-length LSTM
+        # (time × env) ≈ minibatch_size transitions per optimizer step.
+        envs_per_mb = max(1, min(n_env, minibatch_size // max(1, ppo_steps)))
+
+        pi_loss = v_loss = ent_scalar = torch.zeros((), device=device)
         for _ in range(ppo_epochs):
-            logits_full, values_full = model.forward_sequence(obs_map_t, obs_aux_t, done_t)
-            dist = Categorical(logits=logits_full.reshape(-1, NUM_ACTIONS))
-            new_logp = dist.log_prob(act_flat).reshape(ppo_steps, n_env)
-            entropy = dist.entropy().mean()
-            ratio = (new_logp - old_logp).exp()
-            surr1 = ratio * adv_norm
-            surr2 = torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * adv_norm
-            pi_loss = -torch.min(surr1, surr2).mean()
-            v_loss = F.mse_loss(values_full, returns)
-            loss = pi_loss + vf_coef * v_loss - ent_coef * entropy
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-            optimizer.step()
+            env_order = np.random.permutation(n_env)
+            n_mb = 0
+            pi_acc = v_acc = ent_acc = 0.0
+            for s in range(0, n_env, envs_per_mb):
+                idx = env_order[s : s + envs_per_mb]
+                idx_t = torch.tensor(idx, device=device, dtype=torch.long)
 
-        pbar.set_postfix(pi=f"{pi_loss.item():.3f}", v=f"{v_loss.item():.3f}")
+                mb_map = obs_map_t.index_select(1, idx_t)
+                mb_aux = obs_aux_t.index_select(1, idx_t)
+                mb_done = done_t.index_select(1, idx_t)
+                mb_act = act_t.index_select(1, idx_t)
+                mb_old_logp = old_logp.index_select(1, idx_t)
+                mb_adv = adv_norm.index_select(1, idx_t)
+                mb_ret = returns.index_select(1, idx_t)
+
+                Tm, K = mb_map.shape[0], mb_map.shape[1]
+                logits_full, values_full = model.forward_sequence(mb_map, mb_aux, mb_done)
+                dist = Categorical(logits=logits_full.reshape(-1, NUM_ACTIONS))
+                new_logp = dist.log_prob(mb_act.reshape(-1)).reshape(Tm, K)
+                entropy = dist.entropy().reshape(Tm, K).mean()
+                ratio = (new_logp - mb_old_logp).exp()
+                surr1 = ratio * mb_adv
+                surr2 = torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * mb_adv
+                pi_loss = -torch.min(surr1, surr2).mean()
+                v_loss = F.mse_loss(values_full, mb_ret)
+                loss = pi_loss + vf_coef * v_loss - ent_coef * entropy
+
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                optimizer.step()
+
+                n_mb += 1
+                pi_acc += pi_loss.item()
+                v_acc += v_loss.item()
+                ent_acc += entropy.item()
+
+            pi_loss = torch.tensor(pi_acc / max(n_mb, 1), device=device)
+            v_loss = torch.tensor(v_acc / max(n_mb, 1), device=device)
+            ent_scalar = torch.tensor(ent_acc / max(n_mb, 1), device=device)
+
+        pbar.set_postfix(pi=f"{pi_loss.item():.3f}", v=f"{v_loss.item():.3f}", ent=f"{ent_scalar.item():.3f}")
 
     if save_model:
         save_checkpoint(
@@ -492,7 +537,13 @@ if __name__ == "__main__":
     parser.add_argument("--vf_coef", type=float, default=0.5)
     parser.add_argument("--ent_coef", type=float, default=0.01)
     parser.add_argument("--ppo_epochs", type=int, default=4)
-    parser.add_argument("--minibatch_size", type=int, default=256)
+    parser.add_argument(
+        "--minibatch_size",
+        type=int,
+        default=256,
+        help="Recurrent PPO: target transitions per minibatch; env columns per step = "
+        "min(N, max(1, minibatch_size // ppo_steps)), each column runs full ppo_steps LSTM.",
+    )
     parser.add_argument("--save_model", action="store_true")
     parser.add_argument("--load_checkpoint", type=str, default=None)
     parser.add_argument("--skip_bc", action="store_true")
