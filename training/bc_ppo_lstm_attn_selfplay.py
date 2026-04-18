@@ -21,6 +21,7 @@ import os
 import random
 import sys
 from copy import deepcopy
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence, Union, Literal
@@ -822,11 +823,32 @@ def train_bc_ppo_attn_selfplay(
     resume_input_spec = None
     start_update = 0
     if load_checkpoint_path:
+        load_checkpoint_path = str(load_checkpoint_path)
         resume_ckpt = torch.load(load_checkpoint_path, map_location=device)
         resume_meta = resume_ckpt.get("meta", {}) if isinstance(resume_ckpt.get("meta", {}), dict) else {}
         resume_input_spec = resume_meta.get("input_spec") or resume_ckpt.get("input_shape")
-        # Prefer continuing in-place in the same output folder.
-        out_dir = str(Path(load_checkpoint_path).resolve().parent)
+        # Prefer continuing in-place in the same output folder when writable;
+        # otherwise (e.g. Kaggle /kaggle/input) copy to /kaggle/working.
+        src_dir = Path(load_checkpoint_path).resolve().parent
+        out_dir = str(src_dir)
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            test_path = Path(out_dir) / ".write_test"
+            with open(test_path, "w", encoding="utf-8") as f:
+                f.write("ok")
+            test_path.unlink(missing_ok=True)
+        except Exception:
+            # Fallback for read-only filesystems
+            work_root = Path(os.environ.get("KAGGLE_WORKING_DIR", "/kaggle/working")).resolve()
+            run_name = src_dir.name
+            out_dir = str(work_root / run_name)
+            os.makedirs(out_dir, exist_ok=True)
+            # Copy checkpoint locally so subsequent loads use writable storage
+            dst_ckpt = str(Path(out_dir) / Path(load_checkpoint_path).name)
+            if not os.path.exists(dst_ckpt):
+                shutil.copy2(load_checkpoint_path, dst_ckpt)
+            load_checkpoint_path = dst_ckpt
+
         pool_dir = str(Path(out_dir) / "pool")
         os.makedirs(pool_dir, exist_ok=True)
 
