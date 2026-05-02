@@ -1,22 +1,33 @@
-const REGISTRATION_WEBHOOK_URL = "https://arguable-harpist-false.ngrok-free.dev/register";
+const REGISTRATION_WEBHOOK_URL = "http://34.158.46.70:5000/register"; // "https://arguable-harpist-false.ngrok-free.dev/register"; // replaced with production url
 const REGISTRATION_WEBHOOK_BEARER_TOKEN = "4c376ba89b8b8ade3626cb84252f2e35e1c02b2b31c70b630c03345ce4917f57";
 
 // Organizer-managed content placeholders.
 const SUBMISSION_FORM_LINK = "https://forms.gle/TNZb3grb1fJqq14m9";
-const DISCORD_COMMUNITY_LINK = "<SET_DISCORD_LINK>";
+const DISCORD_COMMUNITY_LINK = "https://discord.gg/GqQJzuunBY";
 const CONTACT_HELP_CHANNEL = "devclub.hcmus@gmail.com";
-const CUSTOM_EMAIL_CONTENT = "<SET_CUSTOM_EMAIL_CONTENT>";
+// const CUSTOM_EMAIL_CONTENT = "<SET_CUSTOM_EMAIL_CONTENT>";
 
 function onFormSubmit(e) {
-  const values = e.namedValues || {};
+  // Works reliably for Form submit triggers
+  const answers = {};
+  const itemResponses = e.response.getItemResponses();
 
+  itemResponses.forEach((ir) => {
+    const title = String(ir.getItem().getTitle() || "").trim();
+    const value = String(ir.getResponse() || "").trim();
+    answers[title] = value;
+  });
+
+  Logger.log("Form titles received: " + JSON.stringify(Object.keys(answers)));
+
+  // Map with tolerant fallback for Team Name/title variations
   const payload = {
-    "Team Name": singleValue(values["Team Name"]),
-    "Primary contact name": singleValue(values["Primary contact name"]),
-    "Primary contact email": singleValue(values["Primary contact email"]),
-    "Second contact name": singleValue(values["Second contact name"]),
-    "Second contact email": singleValue(values["Second contact email"]),
-    "Agreement to rules": singleValue(values["Agreement to rules"]),
+    "Team Name": answers["Team Name"] || answers["Team name"] || "",
+    "Primary contact name": answers["Primary contact name"] || "",
+    "Primary contact email": answers["Primary contact email"] || "",
+    "Second contact name": answers["Second contact name"] || "",
+    "Second contact email": answers["Second contact email"] || "",
+    "Agreement to rules": answers["Agreement to rules"] || "",
   };
 
   const response = UrlFetchApp.fetch(REGISTRATION_WEBHOOK_URL, {
@@ -38,7 +49,6 @@ function onFormSubmit(e) {
     return;
   }
 
-  // Build onboarding email with server-issued canonical identity and token.
   const email = payload["Primary contact email"];
   const teamName = result.team_name;
   const canonicalTeamId = result.canonical_team_id;
@@ -63,7 +73,8 @@ function onFormSubmit(e) {
     "- The zip must contain exactly one agent.py.",
     "- No path traversal, no symlinks, no nested archives.",
     "",
-    CUSTOM_EMAIL_CONTENT,
+    "Thank you for participating! We hope you have a fun and valuable competition experience. :')",
+    // CUSTOM_EMAIL_CONTENT,
   ];
 
   MailApp.sendEmail({
