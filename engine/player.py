@@ -37,14 +37,3 @@ class Player:
         # players can overlap
         self.x = new_x
         self.y = new_y
-        
-        # if two players move into the same cell to collect an item, they try to steal from each other, but eventually breaking it... :D
-        if grid[self.x, self.y] in [Map.ITEM_RADIUS, Map.ITEM_CAPACITY] and any(p.x == self.x and p.y == self.y and p.id != self.id for p in players):
-            grid[self.x, self.y] = Map.GRASS
-        
-        if grid[self.x, self.y] == Map.ITEM_RADIUS:
-            self.bomb_radius_bonus = min(self.bomb_radius_bonus + 1, self.MAX_BOMB_RADIUS - 1)
-            grid[self.x, self.y] = Map.GRASS
-        elif grid[self.x, self.y] == Map.ITEM_CAPACITY:
-            self.bombs_left = min(self.bombs_left + 1, self.MAX_BOMB_CAPACITY)
-            grid[self.x, self.y] = Map.GRASS

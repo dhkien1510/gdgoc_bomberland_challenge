@@ -72,6 +72,27 @@ class BomberEnv:
             if dx != 0 or dy != 0:
                 player.move(dx, dy, self.map.grid, self.players, self.bombs) # move first
                 
+        # Resolve item collections after all movements
+        tile_to_players = {}
+        for p in self.players:
+            if p.alive:
+                pos = (p.x, p.y)
+                if pos not in tile_to_players:
+                    tile_to_players[pos] = []
+                tile_to_players[pos].append(p)
+                
+        for (x, y), occupants in tile_to_players.items():
+            cell = self.map.grid[x, y]
+            if cell in [Map.ITEM_RADIUS, Map.ITEM_CAPACITY]:
+                if len(occupants) == 1:
+                    p = occupants[0]
+                    if cell == Map.ITEM_RADIUS:
+                        p.bomb_radius_bonus = min(p.bomb_radius_bonus + 1, Player.MAX_BOMB_RADIUS - 1)
+                    elif cell == Map.ITEM_CAPACITY:
+                        p.bombs_left = min(p.bombs_left + 1, Player.MAX_BOMB_CAPACITY)
+                # Remove the item whether collected (1 occupant) or destroyed (>1 occupant)
+                self.map.grid[x, y] = Map.GRASS
+
         for (bx, by), (owner_id, radius) in pending_bombs.items():
             self.bombs.append(Bomb(bx, by, owner_id, radius=radius)) # then place bombs
             self.players[owner_id].bombs_left -= 1
