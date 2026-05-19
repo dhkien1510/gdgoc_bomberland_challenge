@@ -429,6 +429,8 @@ def train_dqn(user_id=0, enemy_type="simple", num_episodes=100, max_steps=500, s
     plot_moving_average(data=reward_history, window_size=10, save_path=f"{model_folder}/dqn_{enemy_type}_{num_episodes}_episodes_{max_steps}_steps_{seed}_seed_moving_average.png")
 
 def training():
+    from utils import seed_everything
+    
     parser = argparse.ArgumentParser()
     parser.add_argument("--enemy_type", type=str, default="simple", choices=["simple", "smarter", "tactical", "genius", "box_farmer"])
     parser.add_argument("--num_episodes", type=int, default=200, help="Number of episodes to train")
