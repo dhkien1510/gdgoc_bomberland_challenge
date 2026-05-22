@@ -125,11 +125,11 @@ def validate_zip_bytes(zip_data: bytes):
             return False, "extracted_total_too_large", None
 
         manifest[name] = info.file_size
-        if Path(name).name == "agent.py":
+        if name == "agent.py":
             agent_candidates.append(name)
 
     if len(agent_candidates) != 1:
-        return False, "agent_py_missing_or_multiple", None
+        return False, "agent_py_must_be_at_root_of_zip", None
 
     # Forbid requirements.txt as the environment is fixed
     if any(Path(name).name == "requirements.txt" for name in manifest.keys()):
