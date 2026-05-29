@@ -62,12 +62,12 @@ CFG = {
     "ckpt_dir":         "checkpoints",
 
     # Reward shaping weights
-    "r_kill":           5.0,
-    "r_survive_step":   0.005,
-    "r_box_destroy":    0.3,
-    "r_item_collect":   0.5,
-    "r_death":         -3.0,
-    "r_win":            10.0,
+    "r_kill":           10.0,
+    "r_survive_step":   0.0001,
+    "r_box_destroy":    1.0,
+    "r_item_collect":   2.0,
+    "r_death":         -5.0,
+    "r_win":            20.0,
 }
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
