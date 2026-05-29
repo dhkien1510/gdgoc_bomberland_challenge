@@ -24,9 +24,9 @@ import torch.optim as optim
 from torch.distributions import Categorical
 
 # ── Setup path ────────────────────────────────────────────────────────────────
-_HERE = Path(__file__).resolve().parent            # agent/my_agent/
+_HERE = Path(__file__).resolve().parent            # agent/agent/
 ROOT  = _HERE.parent.parent                        # Bomberland-GDGoC-AI-Challenge/
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT))                      # để import engine/, agent/ package
 sys.path.insert(0, str(_HERE))                     # để import model.py cùng thư mục
 
 from engine.game import BomberEnv
