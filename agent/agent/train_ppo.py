@@ -30,7 +30,7 @@ sys.path.insert(0, str(_HERE))                     # để import model.py cùng
 sys.path.insert(0, str(ROOT))                      # ưu tiên cao nhất — để import engine/, agent/ package
 
 from engine.game import BomberEnv
-from agent import SimpleRuleAgent, SmarterRuleAgent, GeniusRuleAgent, BoxFarmerAgent, TacticalRuleAgent
+from agent import RandomAgent, SimpleRuleAgent, SmarterRuleAgent, GeniusRuleAgent, BoxFarmerAgent, TacticalRuleAgent
 from model import CNNActorCritic, encode_obs, encode_aux
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
@@ -124,22 +124,23 @@ def compute_reward(prev_obs, obs, agent_id, done, is_winner):
 class OpponentPool:
     """
     Giữ một pool các checkpoint cũ và baseline agents.
-    Mỗi episode, sample ngẫu nhiên 3 opponents.
+    Curriculum Learning: Chọn bot theo độ khó tăng dần dựa trên global_step.
     """
 
     def __init__(self, model_factory, pool_size=10):
         self.pool_size    = pool_size
         self.model_factory = model_factory
         self.checkpoints  = deque(maxlen=pool_size)   # list of state_dicts
-        self.baselines    = [
-            SimpleRuleAgent, SmarterRuleAgent,
-            GeniusRuleAgent, BoxFarmerAgent, TacticalRuleAgent,
-        ]
+        
+        # Chia làm 3 cấp độ khó cho Curriculum Learning
+        self.easy_bots   = [RandomAgent, SimpleRuleAgent]
+        self.medium_bots = [SimpleRuleAgent, SmarterRuleAgent, BoxFarmerAgent]
+        self.hard_bots   = [SmarterRuleAgent, GeniusRuleAgent, TacticalRuleAgent]
 
     def add_checkpoint(self, state_dict):
         self.checkpoints.append(copy.deepcopy(state_dict))
 
-    def get_opponent(self, agent_id: int):
+    def get_opponent(self, agent_id: int, current_step: int = 0):
         """
         Trả về một opponent agent (rule-based hoặc model-based).
         """
@@ -155,7 +156,13 @@ class OpponentPool:
             model.eval()
             return ModelOpponent(model, agent_id)
         else:
-            cls = random.choice(self.baselines)
+            # Phân cấp độ khó theo tiến độ training
+            if current_step < 3_000_000:
+                cls = random.choice(self.easy_bots)
+            elif current_step < 6_000_000:
+                cls = random.choice(self.medium_bots)
+            else:
+                cls = random.choice(self.hard_bots)
             return cls(agent_id)
 
 
@@ -336,7 +343,7 @@ def train():
     # Khởi tạo episode
     obs         = env.reset()
     agent_id    = 0   # Ta train agent 0 (góc top-left)
-    opponents   = [pool.get_opponent(i) for i in range(1, 4)]
+    opponents   = [pool.get_opponent(i, global_step) for i in range(1, 4)]
     prev_obs    = None
 
     print(f"\n{'='*60}")
@@ -402,7 +409,7 @@ def train():
 
                 # Reset episode
                 obs       = env.reset()
-                opponents = [pool.get_opponent(i) for i in range(1, 4)]
+                opponents = [pool.get_opponent(i, global_step) for i in range(1, 4)]
                 prev_obs  = None
 
         # ── Update phase ───────────────────────────────────────
