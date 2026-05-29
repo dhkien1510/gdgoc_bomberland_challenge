@@ -41,7 +41,7 @@ CFG = {
     "gae_lambda":       0.95,
     "clip_eps":         0.2,
     "value_coef":       0.5,
-    "entropy_coef":     0.01,
+    "entropy_coef":     0.05,
     "max_grad_norm":    0.5,
     "ppo_epochs":       4,
     "batch_size":       256,
