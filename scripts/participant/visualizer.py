@@ -16,10 +16,10 @@ if str(parent_dir) not in sys.path:
 
 from engine import BomberEnv
 from agent import RandomAgent, SimpleRuleAgent, SmarterRuleAgent, TacticalRuleAgent, GeniusRuleAgent, BoxFarmerAgent
-from training import encode_obs, DQNAgent, DQfDAgent
-from training.SQIL import encode_obs as sqil_encode_obs
-from training.bc_ppo_lstm import BC_PPO_LSTM_Agent, is_bc_ppo_lstm_checkpoint
-from training.bc_ppo_lstm_attn_selfplay import ActorCriticAttnLSTM
+# from training import encode_obs, DQNAgent, DQfDAgent
+# from training.SQIL import encode_obs as sqil_encode_obs
+# from training.bc_ppo_lstm import BC_PPO_LSTM_Agent, is_bc_ppo_lstm_checkpoint
+# from training.bc_ppo_lstm_attn_selfplay import ActorCriticAttnLSTM
 from competition.evaluation.runtime_guard import load_agent_instance
 
 class Viewer:
