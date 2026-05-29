@@ -26,8 +26,8 @@ from torch.distributions import Categorical
 # ── Setup path ────────────────────────────────────────────────────────────────
 _HERE = Path(__file__).resolve().parent            # agent/agent/
 ROOT  = _HERE.parent.parent                        # Bomberland-GDGoC-AI-Challenge/
-sys.path.insert(0, str(ROOT))                      # để import engine/, agent/ package
 sys.path.insert(0, str(_HERE))                     # để import model.py cùng thư mục
+sys.path.insert(0, str(ROOT))                      # ưu tiên cao nhất — để import engine/, agent/ package
 
 from engine.game import BomberEnv
 from agent import SimpleRuleAgent, SmarterRuleAgent, GeniusRuleAgent, BoxFarmerAgent, TacticalRuleAgent
