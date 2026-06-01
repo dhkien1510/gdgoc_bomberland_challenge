@@ -10,6 +10,7 @@ import random
 import sys
 import time
 from collections import deque
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -19,19 +20,20 @@ import torch.optim as optim
 
 _HERE = Path(__file__).resolve().parent
 ROOT = _HERE.parent.parent
+BASELINE_DIR = ROOT / "agent"
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+if str(BASELINE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASELINE_DIR))
 
-from agent import (
-    BoxFarmerAgent,
-    GeniusRuleAgent,
-    RandomAgent,
-    SimpleRuleAgent,
-    SmarterRuleAgent,
-    TacticalRuleAgent,
-)
+from box_farmer_agent import BoxFarmerAgent
+from genius_rule_agent import GeniusRuleAgent
+from random_agent import RandomAgent
+from simple_rule_agent import SimpleRuleAgent
+from smarter_rule_agent import SmarterRuleAgent
+from tactical_rule_agent import TacticalRuleAgent
 from engine.game import BomberEnv
 from model import CNNActorCritic, encode_aux, encode_obs, valid_action_mask
 
@@ -51,20 +53,24 @@ CFG = {
     "pool_size": 10,
     "save_every": 200_000,
     "ckpt_dir": "checkpoints",
-    "r_kill": 10.0,
+    "r_kill": 15.0,
     "r_survive_step": 0.0001,
-    "r_box_destroy": 1.0,
-    "r_item_collect": 2.0,
-    "r_death": -5.0,
+    "r_box_destroy": 0.3,
+    "r_item_collect": 1.0,
+    "r_death": -10.0,
     "rank_rewards": {
-        0: 20.0,
+        0: 30.0,
         1: 5.0,
-        2: -5.0,
-        3: -20.0,
+        2: -10.0,
+        3: -30.0,
     },
+    "eval_easy_medium_matches": 100,
+    "eval_hard_matches": 100,
+    "eval_seed_base": 17_291,
 }
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+RANK_TO_POINTS = {0: 3.0, 1: 2.0, 2: 1.0, 3: 0.0}
 print(f"Using device: {DEVICE}")
 
 
@@ -159,6 +165,120 @@ def compute_reward(prev_obs, obs, prev_stats, curr_stats, agent_id, done, rank):
     return reward
 
 
+@contextmanager
+def temporary_random_seed(seed: int):
+    py_state = random.getstate()
+    np_state = np.random.get_state()
+    random.seed(seed)
+    np.random.seed(seed % (2**32 - 1))
+    try:
+        yield
+    finally:
+        random.setstate(py_state)
+        np.random.set_state(np_state)
+
+
+def model_action(model, obs, agent_id: int, deterministic: bool):
+    map_feat = encode_obs(obs, agent_id).unsqueeze(0).to(DEVICE)
+    aux_feat = encode_aux(obs, agent_id).unsqueeze(0).to(DEVICE)
+    action_mask = valid_action_mask(obs, agent_id).unsqueeze(0).to(DEVICE)
+    with torch.no_grad():
+        return int(
+            model.get_action_inference(
+                map_feat,
+                aux_feat,
+                deterministic=deterministic,
+                action_mask=action_mask,
+            )
+        )
+
+
+def run_eval_match(model, opponent_classes, seed: int, agent_id: int):
+    with temporary_random_seed(seed):
+        env = BomberEnv(max_steps=500, seed=seed)
+        obs = env.reset(seed=seed)
+
+        opponent_rng = random.Random(seed ^ 0x5A5A)
+        opponents = {
+            player_id: opponent_rng.choice(opponent_classes)(player_id)
+            for player_id in range(4)
+            if player_id != agent_id
+        }
+
+        alive_mask = [bool(player.alive) for player in env.players]
+        death_order = []
+
+        terminated = False
+        truncated = False
+        while not (terminated or truncated):
+            actions = [0] * 4
+            if env.players[agent_id].alive:
+                actions[agent_id] = model_action(model, obs, agent_id, deterministic=True)
+
+            for opponent_id, opponent in opponents.items():
+                if env.players[opponent_id].alive:
+                    actions[opponent_id] = int(opponent.act(obs))
+
+            obs, terminated, truncated = env.step(actions)
+            record_deaths(env.players, alive_mask, death_order)
+
+        ranks = compute_competition_ranks(env.players, death_order, alive_mask)
+        rank = ranks[agent_id]
+        return {
+            "rank": rank,
+            "points": RANK_TO_POINTS[rank],
+            "win": float(rank == 0),
+        }
+
+
+def evaluate_suite(model, opponent_classes, num_matches: int, seed_offset: int):
+    suite_rng = random.Random(CFG["eval_seed_base"] + seed_offset)
+    total_points = 0.0
+    total_wins = 0.0
+    total_rank = 0.0
+
+    for match_idx in range(num_matches):
+        seed = CFG["eval_seed_base"] + seed_offset + match_idx
+        agent_id = suite_rng.randrange(4)
+        result = run_eval_match(model, opponent_classes, seed=seed, agent_id=agent_id)
+        total_points += result["points"]
+        total_wins += result["win"]
+        total_rank += result["rank"]
+
+    return {
+        "matches": num_matches,
+        "avg_points": total_points / max(num_matches, 1),
+        "win_rate": total_wins / max(num_matches, 1),
+        "avg_rank": total_rank / max(num_matches, 1),
+        "total_points": total_points,
+    }
+
+
+def evaluate_policy(model):
+    easy_medium = evaluate_suite(
+        model,
+        opponent_classes=[SimpleRuleAgent, SmarterRuleAgent, BoxFarmerAgent],
+        num_matches=CFG["eval_easy_medium_matches"],
+        seed_offset=0,
+    )
+    hard = evaluate_suite(
+        model,
+        opponent_classes=[GeniusRuleAgent, TacticalRuleAgent],
+        num_matches=CFG["eval_hard_matches"],
+        seed_offset=10_000,
+    )
+
+    total_matches = easy_medium["matches"] + hard["matches"]
+    total_points = easy_medium["total_points"] + hard["total_points"]
+    eval_score = total_points / max(total_matches, 1)
+
+    return {
+        "score": eval_score,
+        "easy_medium": easy_medium,
+        "hard": hard,
+    }
+
+
 class OpponentPool:
     """
     Keep old checkpoints plus rule-based baselines for curriculum self-play.
@@ -203,16 +323,7 @@ class ModelOpponent:
         self.agent_id = agent_id
 
     def act(self, obs):
-        map_feat = encode_obs(obs, self.agent_id).unsqueeze(0).to(DEVICE)
-        aux_feat = encode_aux(obs, self.agent_id).unsqueeze(0).to(DEVICE)
-        action_mask = valid_action_mask(obs, self.agent_id).unsqueeze(0).to(DEVICE)
-        with torch.no_grad():
-            return self.model.get_action_inference(
-                map_feat,
-                aux_feat,
-                deterministic=False,
-                action_mask=action_mask,
-            )
+        return model_action(self.model, obs, self.agent_id, deterministic=False)
 
 
 class RolloutBuffer:
@@ -367,7 +478,7 @@ def train():
 
     global_step = 0
     episode = 0
-    best_win_rate = 0.0
+    best_eval_score = float("-inf")
     last_save_step = 0
     win_history = deque(maxlen=100)
 
@@ -491,13 +602,40 @@ def train():
 
             pool.add_checkpoint(model.state_dict())
 
-            if win_rate >= best_win_rate:
-                best_win_rate = win_rate
-                torch.save(model.state_dict(), _HERE / "model.pth")
-                print(f"  -> New best model! Win rate: {win_rate:.2%}")
+            eval_stats = evaluate_policy(model)
+            print(
+                "  -> Eval "
+                f"score {eval_stats['score']:.3f} | "
+                f"EM win {eval_stats['easy_medium']['win_rate']:.2%} | "
+                f"Hard win {eval_stats['hard']['win_rate']:.2%}"
+            )
 
-    torch.save(model.state_dict(), _HERE / "model.pth")
-    print("\nTraining done! Final model saved to model.pth")
+            if eval_stats["score"] >= best_eval_score:
+                best_eval_score = eval_stats["score"]
+                torch.save(
+                    {
+                        "model": model.state_dict(),
+                        "global_step": global_step,
+                        "eval": eval_stats,
+                    },
+                    _HERE / "model.pth",
+                )
+                print(f"  -> New best eval model! Score: {best_eval_score:.3f}")
+
+    last_model_path = _HERE / "model_last.pth"
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "global_step": global_step,
+        },
+        last_model_path,
+    )
+
+    if best_eval_score == float("-inf"):
+        torch.save({"model": model.state_dict(), "global_step": global_step}, _HERE / "model.pth")
+
+    print(f"\nTraining done! Best eval model saved to {_HERE / 'model.pth'}")
+    print(f"Latest weights saved to {last_model_path}")
 
 
 if __name__ == "__main__":
