@@ -51,12 +51,15 @@ CFG = {
     "max_grad_norm": 0.5,
     "ppo_epochs": 4,
     "batch_size": 256,
-    "n_steps": 2048,
-    "total_steps": 10_000_000,
+
+    "n_steps": 1024,
+    "total_steps": 100_000,
+
     "selfplay_prob": 0.5,
     "pool_size": 10,
-    "save_every": 200_000,
+    "save_every": 20_000,
     "ckpt_dir": "checkpoints",
+
     "r_kill": 15.0,
     "r_survive_step": 0.0001,
     "r_box_destroy": 0.3,
@@ -68,11 +71,12 @@ CFG = {
         2: -10.0,
         3: -30.0,
     },
-    "eval_easy_medium_matches": 100,
-    "eval_hard_matches": 100,
+
+    "eval_easy_medium_matches": 20,
+    "eval_hard_matches": 20,
     "eval_seed_base": 17_291,
-    "holdout_eval_easy_medium_matches": 50,
-    "holdout_eval_hard_matches": 50,
+    "holdout_eval_easy_medium_matches": 10,
+    "holdout_eval_hard_matches": 10,
     "holdout_eval_seed_base": 91_337,
 }
 
@@ -342,9 +346,9 @@ class OpponentPool:
             model.eval()
             return ModelOpponent(model, agent_id)
 
-        if current_step < 500_000:
+        if current_step < 30_000:
             cls = random.choice(self.easy_bots)
-        elif current_step < 1_000_000:
+        elif current_step < 70_000:
             cls = random.choice(self.medium_bots)
         else:
             cls = random.choice(self.hard_bots)
