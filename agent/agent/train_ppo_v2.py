@@ -265,7 +265,13 @@ def model_action(model, obs, agent_id: int, deterministic: bool, current_step: i
     return env_action, canonical_action
 
 
-def run_eval_match(model, opponent_classes, seed: int, agent_id: int):
+def eval_mask_mode(current_step: int) -> bool:
+    # Keep eval behavior aligned with training during the early exploration
+    # phase, then switch both to the strict safe-bomb mask.
+    return current_step >= CFG["mask_warmup_steps"]
+
+
+def run_eval_match(model, opponent_classes, seed: int, agent_id: int, current_step: int):
     with temporary_random_seed(seed):
         env = BomberEnv(max_steps=500, seed=seed)
         obs = env.reset(seed=seed)
@@ -290,8 +296,8 @@ def run_eval_match(model, opponent_classes, seed: int, agent_id: int):
                     obs,
                     agent_id,
                     deterministic=True,
-                    current_step=CFG["mask_warmup_steps"],
-                    eval_mode=True,
+                    current_step=current_step,
+                    eval_mode=eval_mask_mode(current_step),
                 )
 
             for opponent_id, opponent in opponents.items():
@@ -313,7 +319,7 @@ def run_eval_match(model, opponent_classes, seed: int, agent_id: int):
         }
 
 
-def evaluate_suite(model, opponent_classes, num_matches: int, seed_offset: int, seed_base: int):
+def evaluate_suite(model, opponent_classes, num_matches: int, seed_offset: int, seed_base: int, current_step: int):
     suite_rng = random.Random(seed_base + seed_offset)
     total_points = 0.0
     total_first = 0.0
@@ -324,7 +330,7 @@ def evaluate_suite(model, opponent_classes, num_matches: int, seed_offset: int, 
     for match_idx in range(num_matches):
         seed = seed_base + seed_offset + match_idx
         agent_id = suite_rng.randrange(4)
-        result = run_eval_match(model, opponent_classes, seed=seed, agent_id=agent_id)
+        result = run_eval_match(model, opponent_classes, seed=seed, agent_id=agent_id, current_step=current_step)
         total_points += result["points"]
         total_first += result["first"]
         total_unique_first += result["unique_first"]
@@ -342,13 +348,14 @@ def evaluate_suite(model, opponent_classes, num_matches: int, seed_offset: int, 
     }
 
 
-def _evaluate_policy_with_seed_base(model, seed_base: int, easy_medium_matches: int, hard_matches: int):
+def _evaluate_policy_with_seed_base(model, seed_base: int, easy_medium_matches: int, hard_matches: int, current_step: int):
     easy_medium = evaluate_suite(
         model,
         opponent_classes=[SimpleRuleAgent, SmarterRuleAgent, BoxFarmerAgent],
         num_matches=easy_medium_matches,
         seed_offset=0,
         seed_base=seed_base,
+        current_step=current_step,
     )
     hard = evaluate_suite(
         model,
@@ -356,6 +363,7 @@ def _evaluate_policy_with_seed_base(model, seed_base: int, easy_medium_matches: 
         num_matches=hard_matches,
         seed_offset=10_000,
         seed_base=seed_base,
+        current_step=current_step,
     )
     total_matches = easy_medium["matches"] + hard["matches"]
     total_points = easy_medium["total_points"] + hard["total_points"]
@@ -366,18 +374,20 @@ def _evaluate_policy_with_seed_base(model, seed_base: int, easy_medium_matches: 
     }
 
 
-def evaluate_policy(model):
+def evaluate_policy(model, current_step: int):
     dev = _evaluate_policy_with_seed_base(
         model,
         seed_base=CFG["eval_seed_base"],
         easy_medium_matches=CFG["eval_easy_medium_matches"],
         hard_matches=CFG["eval_hard_matches"],
+        current_step=current_step,
     )
     holdout = _evaluate_policy_with_seed_base(
         model,
         seed_base=CFG["holdout_eval_seed_base"],
         easy_medium_matches=CFG["holdout_eval_easy_medium_matches"],
         hard_matches=CFG["holdout_eval_hard_matches"],
+        current_step=current_step,
     )
     return {"dev": dev, "holdout": holdout}
 
@@ -405,7 +415,7 @@ class OpponentPool:
             model.load_state_dict(checkpoint)
             model.to(DEVICE)
             model.eval()
-            return ModelOpponent(model, agent_id)
+            return ModelOpponent(model, agent_id, current_step)
 
         if current_step < CFG["mask_warmup_steps"]:
             cls = random.choice(self.easy_bots)
@@ -417,9 +427,10 @@ class OpponentPool:
 
 
 class ModelOpponent:
-    def __init__(self, model, agent_id):
+    def __init__(self, model, agent_id, current_step: int):
         self.model = model
         self.agent_id = agent_id
+        self.current_step = current_step
 
     def act(self, obs):
         env_action, _ = model_action(
@@ -427,8 +438,8 @@ class ModelOpponent:
             obs,
             self.agent_id,
             deterministic=False,
-            current_step=CFG["mask_warmup_steps"],
-            eval_mode=True,
+            current_step=self.current_step,
+            eval_mode=eval_mask_mode(self.current_step),
         )
         return env_action
 
@@ -726,7 +737,7 @@ def train():
             print(f"  -> Saved checkpoint: {ckpt_path}")
 
             pool.add_checkpoint(model.state_dict())
-            eval_stats = evaluate_policy(model)
+            eval_stats = evaluate_policy(model, current_step=global_step)
             dev_stats = eval_stats["dev"]
             holdout_stats = eval_stats["holdout"]
 

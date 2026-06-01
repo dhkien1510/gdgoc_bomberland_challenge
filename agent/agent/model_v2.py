@@ -15,7 +15,7 @@ BOMB_TIMER_MAX = 7.0
 NUM_ACTIONS = 6
 NUM_CHANNELS = 13
 AUX_DIM = 5
-MASK_WARMUP_STEPS = 400_000
+MASK_WARMUP_STEPS = 100_000
 SAFE_BOMB_HORIZON = 7
 
 ACTION_STOP = 0
@@ -80,6 +80,10 @@ def canonicalize_obs(obs: dict, agent_id: int) -> dict:
 
 
 def _swap_axis_actions(action: int, flip_rows: bool, flip_cols: bool) -> int:
+    # The engine's action IDs are not aligned with the natural axis names:
+    # LEFT/RIGHT move along rows, UP/DOWN move along columns. After a row flip,
+    # the engine row actions must be swapped; after a column flip, the engine
+    # column actions must be swapped.
     if flip_rows:
         if action == ACTION_LEFT:
             action = ACTION_RIGHT
