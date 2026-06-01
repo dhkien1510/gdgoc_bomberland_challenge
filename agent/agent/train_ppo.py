@@ -23,10 +23,15 @@ ROOT = _HERE.parent.parent
 BASELINE_DIR = ROOT / "agent"
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
+
+# Import local model helpers before adding BASELINE_DIR to sys.path to avoid
+# accidentally resolving a different model.py from sibling folders.
+from model import CNNActorCritic, encode_aux, encode_obs, valid_action_mask
+
 if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+    sys.path.append(str(ROOT))
 if str(BASELINE_DIR) not in sys.path:
-    sys.path.insert(0, str(BASELINE_DIR))
+    sys.path.append(str(BASELINE_DIR))
 
 from box_farmer_agent import BoxFarmerAgent
 from genius_rule_agent import GeniusRuleAgent
@@ -35,7 +40,6 @@ from simple_rule_agent import SimpleRuleAgent
 from smarter_rule_agent import SmarterRuleAgent
 from tactical_rule_agent import TacticalRuleAgent
 from engine.game import BomberEnv
-from model import CNNActorCritic, encode_aux, encode_obs, valid_action_mask
 
 CFG = {
     "lr": 2.5e-4,
@@ -67,6 +71,9 @@ CFG = {
     "eval_easy_medium_matches": 100,
     "eval_hard_matches": 100,
     "eval_seed_base": 17_291,
+    "holdout_eval_easy_medium_matches": 50,
+    "holdout_eval_hard_matches": 50,
+    "holdout_eval_seed_base": 91_337,
 }
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -224,59 +231,86 @@ def run_eval_match(model, opponent_classes, seed: int, agent_id: int):
 
         ranks = compute_competition_ranks(env.players, death_order, alive_mask)
         rank = ranks[agent_id]
+        first_group_size = sum(1 for r in ranks if r == 0)
         return {
             "rank": rank,
             "points": RANK_TO_POINTS[rank],
             "win": float(rank == 0),
+            "unique_first": float(rank == 0 and first_group_size == 1),
+            "shared_first": float(rank == 0 and first_group_size > 1),
         }
 
 
-def evaluate_suite(model, opponent_classes, num_matches: int, seed_offset: int):
-    suite_rng = random.Random(CFG["eval_seed_base"] + seed_offset)
+def evaluate_suite(model, opponent_classes, num_matches: int, seed_offset: int, seed_base: int):
+    suite_rng = random.Random(seed_base + seed_offset)
     total_points = 0.0
     total_wins = 0.0
+    total_unique_first = 0.0
+    total_shared_first = 0.0
     total_rank = 0.0
 
     for match_idx in range(num_matches):
-        seed = CFG["eval_seed_base"] + seed_offset + match_idx
+        seed = seed_base + seed_offset + match_idx
         agent_id = suite_rng.randrange(4)
         result = run_eval_match(model, opponent_classes, seed=seed, agent_id=agent_id)
         total_points += result["points"]
         total_wins += result["win"]
+        total_unique_first += result["unique_first"]
+        total_shared_first += result["shared_first"]
         total_rank += result["rank"]
 
     return {
         "matches": num_matches,
         "avg_points": total_points / max(num_matches, 1),
-        "win_rate": total_wins / max(num_matches, 1),
+        "first_rate": total_wins / max(num_matches, 1),
+        "unique_first_rate": total_unique_first / max(num_matches, 1),
+        "shared_first_rate": total_shared_first / max(num_matches, 1),
         "avg_rank": total_rank / max(num_matches, 1),
         "total_points": total_points,
     }
 
 
-def evaluate_policy(model):
+def _evaluate_policy_with_seed_base(model, seed_base: int, easy_medium_matches: int, hard_matches: int):
     easy_medium = evaluate_suite(
         model,
         opponent_classes=[SimpleRuleAgent, SmarterRuleAgent, BoxFarmerAgent],
-        num_matches=CFG["eval_easy_medium_matches"],
+        num_matches=easy_medium_matches,
         seed_offset=0,
+        seed_base=seed_base,
     )
     hard = evaluate_suite(
         model,
         opponent_classes=[GeniusRuleAgent, TacticalRuleAgent],
-        num_matches=CFG["eval_hard_matches"],
+        num_matches=hard_matches,
         seed_offset=10_000,
+        seed_base=seed_base,
     )
 
     total_matches = easy_medium["matches"] + hard["matches"]
     total_points = easy_medium["total_points"] + hard["total_points"]
-    eval_score = total_points / max(total_matches, 1)
+    score = total_points / max(total_matches, 1)
 
     return {
-        "score": eval_score,
+        "score": score,
         "easy_medium": easy_medium,
         "hard": hard,
     }
+
+
+def evaluate_policy(model):
+    dev = _evaluate_policy_with_seed_base(
+        model,
+        seed_base=CFG["eval_seed_base"],
+        easy_medium_matches=CFG["eval_easy_medium_matches"],
+        hard_matches=CFG["eval_hard_matches"],
+    )
+    holdout = _evaluate_policy_with_seed_base(
+        model,
+        seed_base=CFG["holdout_eval_seed_base"],
+        easy_medium_matches=CFG["holdout_eval_easy_medium_matches"],
+        hard_matches=CFG["holdout_eval_hard_matches"],
+    )
+    return {"dev": dev, "holdout": holdout}
 
 
 class OpponentPool:
@@ -603,15 +637,23 @@ def train():
             pool.add_checkpoint(model.state_dict())
 
             eval_stats = evaluate_policy(model)
+            dev_stats = eval_stats["dev"]
+            holdout_stats = eval_stats["holdout"]
             print(
-                "  -> Eval "
-                f"score {eval_stats['score']:.3f} | "
-                f"EM win {eval_stats['easy_medium']['win_rate']:.2%} | "
-                f"Hard win {eval_stats['hard']['win_rate']:.2%}"
+                "  -> Dev "
+                f"score {dev_stats['score']:.3f} | "
+                f"EM unique/shared {dev_stats['easy_medium']['unique_first_rate']:.2%}/{dev_stats['easy_medium']['shared_first_rate']:.2%} | "
+                f"Hard unique/shared {dev_stats['hard']['unique_first_rate']:.2%}/{dev_stats['hard']['shared_first_rate']:.2%}"
+            )
+            print(
+                "  -> Holdout "
+                f"score {holdout_stats['score']:.3f} | "
+                f"EM unique/shared {holdout_stats['easy_medium']['unique_first_rate']:.2%}/{holdout_stats['easy_medium']['shared_first_rate']:.2%} | "
+                f"Hard unique/shared {holdout_stats['hard']['unique_first_rate']:.2%}/{holdout_stats['hard']['shared_first_rate']:.2%}"
             )
 
-            if eval_stats["score"] >= best_eval_score:
-                best_eval_score = eval_stats["score"]
+            if dev_stats["score"] >= best_eval_score:
+                best_eval_score = dev_stats["score"]
                 torch.save(
                     {
                         "model": model.state_dict(),
@@ -620,7 +662,7 @@ def train():
                     },
                     _HERE / "model.pth",
                 )
-                print(f"  -> New best eval model! Score: {best_eval_score:.3f}")
+                print(f"  -> New best dev-eval model! Score: {best_eval_score:.3f}")
 
     last_model_path = _HERE / "model_last.pth"
     torch.save(

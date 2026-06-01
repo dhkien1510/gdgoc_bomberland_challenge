@@ -175,14 +175,19 @@ def has_escape_after_placing_bomb(obs: dict, agent_id: int) -> bool:
         danger_time = earliest_danger.get(pos)
         return danger_time is None or danger_time > step
 
-    queue = deque([(0, row, col)])
-    visited = {(0, row, col)}
+    # PLACE_BOMB consumes the current action, so the agent must survive step 1
+    # while still on the current tile before any movement is possible.
+    if not safe_at_time((row, col), 1):
+        return False
+
+    queue = deque([(1, row, col)])
+    visited = {(1, row, col)}
 
     while queue:
         step, cur_row, cur_col = queue.popleft()
 
         if (
-            0 < step < virtual_explode_at
+            step < virtual_explode_at
             and (cur_row, cur_col) not in virtual_blast_tiles
             and safe_at_time((cur_row, cur_col), step)
         ):
@@ -269,7 +274,6 @@ def valid_action_mask(obs: dict, agent_id: int) -> torch.Tensor:
     bomb_state = _build_bomb_state(obs)
 
     mask = np.zeros(NUM_ACTIONS, dtype=np.bool_)
-    mask[ACTION_STOP] = True
 
     if agent_id < 0 or agent_id >= len(players):
         return torch.from_numpy(mask)
@@ -277,6 +281,12 @@ def valid_action_mask(obs: dict, agent_id: int) -> torch.Tensor:
     row, col, alive, bombs_left, _radius_bonus = (int(v) for v in players[agent_id][:5])
     if alive == 0:
         return torch.from_numpy(mask)
+
+    def safe_at_time(pos: tuple[int, int], step: int) -> bool:
+        danger_time = bomb_state["earliest_danger"].get(pos)
+        return danger_time is None or danger_time > step
+
+    mask[ACTION_STOP] = safe_at_time((row, col), 1)
 
     bomb_tiles = set(bomb_state["bomb_positions"].keys())
 
@@ -286,10 +296,15 @@ def valid_action_mask(obs: dict, agent_id: int) -> torch.Tensor:
             continue
         if (nr, nc) in bomb_tiles:
             continue
+        if not safe_at_time((nr, nc), 1):
+            continue
         mask[action] = True
 
     if bombs_left > 0 and (row, col) not in bomb_tiles and has_escape_after_placing_bomb(obs, agent_id):
         mask[ACTION_PLACE_BOMB] = True
+
+    if not mask.any():
+        mask[ACTION_STOP] = True
 
     return torch.from_numpy(mask)
 
