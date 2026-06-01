@@ -42,6 +42,7 @@ from tactical_rule_agent import TacticalRuleAgent
 from engine.game import BomberEnv
 
 CFG = {
+    # PPO core
     "lr": 2.5e-4,
     "gamma": 0.99,
     "gae_lambda": 0.95,
@@ -52,14 +53,17 @@ CFG = {
     "ppo_epochs": 4,
     "batch_size": 256,
 
+    # Rollout / duration
     "n_steps": 1024,
-    "total_steps": 900_000,
+    "total_steps": 2_000_000,
 
-    "selfplay_prob": 0.5,
-    "pool_size": 10,
-    "save_every": 20_000,
+    # Self-play
+    "selfplay_prob": 0.35,
+    "pool_size": 8,
+    "save_every": 100_000,
     "ckpt_dir": "checkpoints",
 
+    # Reward shaping
     "r_kill": 15.0,
     "r_survive_step": 0.0001,
     "r_box_destroy": 0.3,
@@ -72,11 +76,14 @@ CFG = {
         3: -30.0,
     },
 
-    "eval_easy_medium_matches": 20,
-    "eval_hard_matches": 20,
+    # Dev eval - dùng để chọn best model
+    "eval_easy_medium_matches": 40,
+    "eval_hard_matches": 40,
     "eval_seed_base": 17_291,
-    "holdout_eval_easy_medium_matches": 10,
-    "holdout_eval_hard_matches": 10,
+
+    # Holdout eval - chỉ để quan sát overfit
+    "holdout_eval_easy_medium_matches": 20,
+    "holdout_eval_hard_matches": 20,
     "holdout_eval_seed_base": 91_337,
 }
 
@@ -346,9 +353,9 @@ class OpponentPool:
             model.eval()
             return ModelOpponent(model, agent_id)
 
-        if current_step < 100_000:
+        if current_step < 400_000:
             cls = random.choice(self.easy_bots)
-        elif current_step < 300_000:
+        elif current_step < 1_100_000:
             cls = random.choice(self.medium_bots)
         else:
             cls = random.choice(self.hard_bots)
