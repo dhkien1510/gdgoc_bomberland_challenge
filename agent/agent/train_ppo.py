@@ -53,7 +53,7 @@ CFG = {
     "batch_size": 256,
 
     "n_steps": 1024,
-    "total_steps": 100_000,
+    "total_steps": 900_000,
 
     "selfplay_prob": 0.5,
     "pool_size": 10,
@@ -346,9 +346,9 @@ class OpponentPool:
             model.eval()
             return ModelOpponent(model, agent_id)
 
-        if current_step < 30_000:
+        if current_step < 100_000:
             cls = random.choice(self.easy_bots)
-        elif current_step < 70_000:
+        elif current_step < 300_000:
             cls = random.choice(self.medium_bots)
         else:
             cls = random.choice(self.hard_bots)
