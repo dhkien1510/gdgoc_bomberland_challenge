@@ -342,9 +342,9 @@ class OpponentPool:
             model.eval()
             return ModelOpponent(model, agent_id)
 
-        if current_step < 3_000_000:
+        if current_step < 500_000:
             cls = random.choice(self.easy_bots)
-        elif current_step < 6_000_000:
+        elif current_step < 1_000_000:
             cls = random.choice(self.medium_bots)
         else:
             cls = random.choice(self.hard_bots)
