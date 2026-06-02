@@ -329,6 +329,7 @@ def main():
             obs, terminated, truncated = env.step(actions)
             done = terminated or truncated
             step_idx += 1
+        print(f"finish {episode_offset}")
 
         if (episode_offset + 1) % args.episodes_per_shard == 0:
             shard_idx = flush_shard(output_dir, shard_idx, buffers)

@@ -6,11 +6,12 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import warnings
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import ConcatDataset, DataLoader, WeightedRandomSampler
+from torch.utils.data import ConcatDataset, DataLoader, Subset, WeightedRandomSampler
 
 from bc_dataset import BCSequenceDataset, load_bc_shards, split_episode_keys
 from bc_model import CNNLSTMBCActor
@@ -28,9 +29,12 @@ def parse_args():
     parser.add_argument("--seq_len", type=int, default=64)
     parser.add_argument("--stride", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--bomb_weight", type=float, default=1.5)
-    parser.add_argument("--illegal_action_coef", type=float, default=0.1)
+    parser.add_argument("--bomb_weight", type=float, default=1.0)
+    parser.add_argument("--raw_ce_coef", type=float, default=0.7)
+    parser.add_argument("--masked_ce_coef", type=float, default=0.3)
+    parser.add_argument("--illegal_action_coef", type=float, default=0.03)
     parser.add_argument("--illegal_margin", type=float, default=0.1)
+    parser.add_argument("--overfit_sequences", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -75,19 +79,55 @@ def build_multi_dir_datasets(data_dirs: list[str], scenario_weights: list[float]
     return train_datasets, val_datasets, scenario_infos
 
 
+def maybe_limit_sequences(
+    datasets: list[BCSequenceDataset],
+    scenario_infos: list[dict],
+    overfit_sequences: int,
+    seed: int,
+):
+    if overfit_sequences <= 0:
+        return datasets, scenario_infos
+
+    limited_datasets: list[torch.utils.data.Subset] = []
+    updated_infos: list[dict] = []
+    rng = np.random.default_rng(seed)
+
+    for dataset, info in zip(datasets, scenario_infos):
+        take = min(len(dataset), overfit_sequences)
+        if take <= 0:
+            limited_datasets.append(torch.utils.data.Subset(dataset, []))
+            cloned = dict(info)
+            cloned["train_sequences"] = 0
+            updated_infos.append(cloned)
+            continue
+        indices = np.arange(len(dataset))
+        rng.shuffle(indices)
+        chosen = indices[:take].tolist()
+        limited_datasets.append(torch.utils.data.Subset(dataset, chosen))
+        cloned = dict(info)
+        cloned["train_sequences"] = take
+        updated_infos.append(cloned)
+    return limited_datasets, updated_infos
+
+
 def make_balanced_concat_sampler(datasets: list[BCSequenceDataset], scenario_weights: list[float]):
     sample_weights = []
     for dataset, scenario_weight in zip(datasets, scenario_weights):
         if len(dataset) == 0:
             continue
-        bucket_weights = dataset.bucket_weights()
+        if isinstance(dataset, Subset):
+            if not hasattr(dataset.dataset, "bucket_weights"):
+                raise TypeError("Subset base dataset must define bucket_weights()")
+            bucket_weights = dataset.dataset.bucket_weights()[dataset.indices]
+        else:
+            bucket_weights = dataset.bucket_weights()
         scenario_base = float(scenario_weight) / float(len(dataset))
         sample_weights.extend((scenario_base * bucket_weights).tolist())
     weights = torch.tensor(sample_weights, dtype=torch.float32)
     return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
 
 
-def masked_ce_loss(logits, targets, loss_mask, class_weights):
+def ce_from_logits(logits, targets, loss_mask, class_weights):
     batch, seq, num_actions = logits.shape
     flat_logits = logits.reshape(batch * seq, num_actions)
     flat_targets = targets.reshape(batch * seq)
@@ -97,30 +137,39 @@ def masked_ce_loss(logits, targets, loss_mask, class_weights):
     return losses.mean() if losses.numel() > 0 else torch.zeros((), device=logits.device)
 
 
-def illegal_action_margin_loss(raw_logits, action_masks, loss_mask, margin: float):
-    flat_logits = raw_logits.reshape(-1, raw_logits.shape[-1])
+def mask_logits(raw_logits, action_masks):
+    return raw_logits.masked_fill(~action_masks.bool(), -1e9)
+
+
+def invalid_action_mass_loss(raw_logits, action_masks, loss_mask):
     flat_masks = action_masks.reshape(-1, action_masks.shape[-1]).bool()
     flat_valid_steps = loss_mask.reshape(-1) > 0
     if not torch.any(flat_valid_steps):
         return torch.zeros((), device=raw_logits.device)
 
-    logits = flat_logits[flat_valid_steps]
+    probs = torch.softmax(raw_logits, dim=-1).reshape(-1, raw_logits.shape[-1])[flat_valid_steps]
     masks = flat_masks[flat_valid_steps]
-    valid_logits = logits.masked_fill(~masks, -1e9)
-    best_valid = valid_logits.max(dim=-1).values
-    invalid_mask = ~masks
-    if not torch.any(invalid_mask):
-        return torch.zeros((), device=raw_logits.device)
-
-    violations = F.relu(logits - best_valid.unsqueeze(-1) + margin)
-    return (violations * invalid_mask).sum() / invalid_mask.sum().clamp_min(1)
+    invalid_mass = (probs * (~masks).float()).sum(dim=-1)
+    return invalid_mass.mean()
 
 
 @torch.no_grad()
-def evaluate_loader(model, loader, device, bomb_weight: float, illegal_margin: float):
+def evaluate_loader(
+    model,
+    loader,
+    device,
+    bomb_weight: float,
+    raw_ce_coef: float,
+    masked_ce_coef: float,
+    invalid_action_coef: float,
+):
+    was_training = model.training
+    model.eval()
+
     total_loss = 0.0
     total_steps = 0
     total_correct = 0
+    total_raw_correct = 0
     bomb_tp = 0
     bomb_fp = 0
     bomb_fn = 0
@@ -131,7 +180,7 @@ def evaluate_loader(model, loader, device, bomb_weight: float, illegal_margin: f
     valuable_correct = 0
     valuable_total = 0
     illegal_before_mask = 0
-    illegal_margin_total = 0.0
+    invalid_mass_total = 0.0
     confusion = torch.zeros((6, 6), dtype=torch.int64)
 
     class_weights = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, bomb_weight], device=device)
@@ -153,19 +202,16 @@ def evaluate_loader(model, loader, device, bomb_weight: float, illegal_margin: f
         )
         raw_pred = raw_logits.argmax(dim=-1)
         illegal_before_mask += int(((~action_masks.gather(-1, raw_pred.unsqueeze(-1)).squeeze(-1)) & (loss_mask > 0)).sum().item())
-
-        logits, _ = model.forward_sequence(
-            map_feats,
-            aux_feats,
-            action_mask_seq=action_masks,
-            episode_start_mask=episode_starts,
-        )
-        loss = masked_ce_loss(logits, actions, loss_mask, class_weights)
-        illegal_margin_total += float(
-            illegal_action_margin_loss(raw_logits, action_masks, loss_mask, illegal_margin).item()
-        ) * int((loss_mask > 0).sum().item())
-        preds = logits.argmax(dim=-1)
         valid = loss_mask > 0
+        total_raw_correct += int(((raw_pred == actions) & valid).sum().item())
+
+        masked_logits = mask_logits(raw_logits, action_masks)
+        raw_ce = ce_from_logits(raw_logits, actions, loss_mask, class_weights)
+        masked_ce = ce_from_logits(masked_logits, actions, loss_mask, class_weights)
+        invalid_mass = invalid_action_mass_loss(raw_logits, action_masks, loss_mask)
+        loss = raw_ce_coef * raw_ce + masked_ce_coef * masked_ce + invalid_action_coef * invalid_mass
+        invalid_mass_total += float(invalid_mass.item()) * int((loss_mask > 0).sum().item())
+        preds = masked_logits.argmax(dim=-1)
 
         total_loss += float(loss.item()) * int(valid.sum().item())
         total_steps += int(valid.sum().item())
@@ -192,9 +238,10 @@ def evaluate_loader(model, loader, device, bomb_weight: float, illegal_margin: f
         valuable_correct += int(((preds == actions) & valuable_mask).sum().item())
 
     denom = max(total_steps, 1)
-    return {
+    stats = {
         "loss": total_loss / denom,
         "accuracy": total_correct / denom,
+        "raw_accuracy": total_raw_correct / denom,
         "bomb_precision": bomb_tp / max(bomb_tp + bomb_fp, 1),
         "bomb_recall": bomb_tp / max(bomb_tp + bomb_fn, 1),
         "pred_bomb_rate": pred_bomb_count / denom,
@@ -202,9 +249,12 @@ def evaluate_loader(model, loader, device, bomb_weight: float, illegal_margin: f
         "danger_accuracy": danger_correct / max(danger_total, 1),
         "valuable_accuracy": valuable_correct / max(valuable_total, 1),
         "illegal_before_mask_rate": illegal_before_mask / denom,
-        "illegal_margin_loss": illegal_margin_total / denom,
+        "invalid_action_mass": invalid_mass_total / denom,
         "confusion_matrix": confusion.numpy(),
     }
+    if was_training:
+        model.train()
+    return stats
 
 
 def main():
@@ -212,12 +262,25 @@ def main():
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    if args.illegal_margin != 0.1:
+        warnings.warn(
+            "--illegal_margin is ignored in the current BC objective. "
+            "The old margin loss was removed in favor of invalid_action_mass_loss.",
+            stacklevel=2,
+        )
+
     scenario_weights = normalize_scenario_weights(args.data_dir, args.scenario_weight)
     train_datasets, val_datasets, scenario_infos = build_multi_dir_datasets(
         args.data_dir,
         scenario_weights,
         seq_len=args.seq_len,
         stride=args.stride,
+        seed=args.seed,
+    )
+    train_datasets, scenario_infos = maybe_limit_sequences(
+        train_datasets,
+        scenario_infos,
+        overfit_sequences=args.overfit_sequences,
         seed=args.seed,
     )
 
@@ -234,6 +297,8 @@ def main():
             f"train seq {info['train_sequences']:,} | val seq {info['val_sequences']:,} | "
             f"source {info['data_dir']}"
         )
+    if args.overfit_sequences > 0:
+        print(f"Overfit debug mode: limiting each scenario to <= {args.overfit_sequences} train sequences")
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
@@ -249,7 +314,9 @@ def main():
     for epoch in range(1, args.epochs + 1):
         model.train()
         running_loss = 0.0
-        running_illegal_margin = 0.0
+        running_raw_ce = 0.0
+        running_masked_ce = 0.0
+        running_invalid_mass = 0.0
         seen_steps = 0
         for batch in train_loader:
             map_feats = batch["map_feats"].to(device)
@@ -265,20 +332,19 @@ def main():
                 action_mask_seq=None,
                 episode_start_mask=episode_starts,
             )
-            logits, _ = model.forward_sequence(
-                map_feats,
-                aux_feats,
-                action_mask_seq=action_masks,
-                episode_start_mask=episode_starts,
-            )
-            ce_loss = masked_ce_loss(logits, actions, loss_mask, class_weights)
-            illegal_loss = illegal_action_margin_loss(
+            masked_logits = mask_logits(raw_logits, action_masks)
+            raw_ce = ce_from_logits(raw_logits, actions, loss_mask, class_weights)
+            masked_ce = ce_from_logits(masked_logits, actions, loss_mask, class_weights)
+            invalid_loss = invalid_action_mass_loss(
                 raw_logits,
                 action_masks,
                 loss_mask,
-                margin=args.illegal_margin,
             )
-            loss = ce_loss + args.illegal_action_coef * illegal_loss
+            loss = (
+                args.raw_ce_coef * raw_ce
+                + args.masked_ce_coef * masked_ce
+                + args.illegal_action_coef * invalid_loss
+            )
 
             optimizer.zero_grad()
             loss.backward()
@@ -286,34 +352,43 @@ def main():
             optimizer.step()
 
             running_loss += float(loss.item()) * int((loss_mask > 0).sum().item())
-            running_illegal_margin += float(illegal_loss.item()) * int((loss_mask > 0).sum().item())
+            running_raw_ce += float(raw_ce.item()) * int((loss_mask > 0).sum().item())
+            running_masked_ce += float(masked_ce.item()) * int((loss_mask > 0).sum().item())
+            running_invalid_mass += float(invalid_loss.item()) * int((loss_mask > 0).sum().item())
             seen_steps += int((loss_mask > 0).sum().item())
 
         train_loss = running_loss / max(seen_steps, 1)
-        train_illegal_margin = running_illegal_margin / max(seen_steps, 1)
+        train_raw_ce = running_raw_ce / max(seen_steps, 1)
+        train_masked_ce = running_masked_ce / max(seen_steps, 1)
+        train_invalid_mass = running_invalid_mass / max(seen_steps, 1)
         val_stats = evaluate_loader(
             model,
             val_loader,
             device,
             bomb_weight=args.bomb_weight,
-            illegal_margin=args.illegal_margin,
+            raw_ce_coef=args.raw_ce_coef,
+            masked_ce_coef=args.masked_ce_coef,
+            invalid_action_coef=args.illegal_action_coef,
         )
         score = (
             val_stats["accuracy"]
+            + 0.10 * val_stats["raw_accuracy"]
             + 0.20 * val_stats["bomb_recall"]
             + 0.10 * val_stats["bomb_precision"]
             - 0.30 * val_stats["illegal_before_mask_rate"]
+            - 0.10 * val_stats["invalid_action_mass"]
             - 0.10 * abs(val_stats["pred_bomb_rate"] - val_stats["true_bomb_rate"])
         )
 
         print(
             f"Epoch {epoch:>2} | train_loss {train_loss:.4f} | "
-            f"val_loss {val_stats['loss']:.4f} | acc {val_stats['accuracy']:.2%} | "
+            f"val_loss {val_stats['loss']:.4f} | acc/raw {val_stats['accuracy']:.2%}/{val_stats['raw_accuracy']:.2%} | "
             f"bomb P/R {val_stats['bomb_precision']:.2%}/{val_stats['bomb_recall']:.2%} | "
             f"bomb pred/true {val_stats['pred_bomb_rate']:.2%}/{val_stats['true_bomb_rate']:.2%} | "
             f"danger {val_stats['danger_accuracy']:.2%} | valuable {val_stats['valuable_accuracy']:.2%} | "
             f"illegal_pre_mask {val_stats['illegal_before_mask_rate']:.2%} | "
-            f"illegal_margin train/val {train_illegal_margin:.4f}/{val_stats['illegal_margin_loss']:.4f}"
+            f"raw_ce {train_raw_ce:.4f} | masked_ce {train_masked_ce:.4f} | "
+            f"invalid_mass train/val {train_invalid_mass:.4f}/{val_stats['invalid_action_mass']:.4f}"
         )
         cm = val_stats["confusion_matrix"]
         cm_rows = " | ".join(

@@ -152,7 +152,7 @@ class BCSequenceDataset(Dataset):
             danger_times[:actual_len] = self.arrays["danger_times"][indices]
             valuable_states[:actual_len] = self.arrays["valuable_states"][indices]
             loss_mask[:actual_len] = 1.0
-            episode_starts[0] = True
+            episode_starts[0] = sample.start == 0
 
         return {
             "map_feats": torch.from_numpy(map_feats),

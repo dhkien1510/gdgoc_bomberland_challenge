@@ -68,7 +68,36 @@ What to look for:
 
 This is the preferred way to keep `selfplay` from dominating the dataset just because it has more samples.
 
-## Phase 3: Train BC Smoke
+## Phase 3: Overfit Debug Before Full BC Smoke
+
+Before a full smoke run, confirm the objective can overfit a tiny subset. This catches loss or sequence bugs much earlier than looking at 8 epochs of flat metrics.
+
+```powershell
+python agent/agent/v6/train_bc.py `
+  --data_dir `
+    agent/agent/v6/bc_data_smoke/farm `
+    agent/agent/v6/bc_data_smoke/survive `
+    agent/agent/v6/bc_data_smoke/pressure `
+    agent/agent/v6/bc_data_smoke/selfplay `
+  --scenario_weight 0.22 0.28 0.30 0.20 `
+  --epochs 20 --batch_size 32 --seq_len 64 --stride 32 `
+  --bomb_weight 1.0 `
+  --illegal_action_coef 0.03 `
+  --raw_ce_coef 0.7 `
+  --masked_ce_coef 0.3 `
+  --overfit_sequences 128
+```
+
+What to expect:
+
+- train loss should fall clearly
+- confusion matrix should move toward the diagonal
+- `illegal_pre_mask_rate` should decrease over epochs
+- `bomb pred/true` should not diverge wildly
+
+If overfit mode cannot improve, fix BC before collecting more data.
+
+## Phase 4: Train BC Smoke
 
 Train a small BC model:
 
@@ -79,28 +108,37 @@ python agent/agent/v6/train_bc.py `
     agent/agent/v6/bc_data_smoke/survive `
     agent/agent/v6/bc_data_smoke/pressure `
     agent/agent/v6/bc_data_smoke/selfplay `
-  --scenario_weight 0.17 0.28 0.30 0.25 `
-  --epochs 5 --batch_size 32 --seq_len 64 --stride 32
+  --scenario_weight 0.22 0.28 0.30 0.20 `
+  --epochs 8 --batch_size 32 --seq_len 64 --stride 32 `
+  --bomb_weight 1.0 `
+  --illegal_action_coef 0.03 `
+  --raw_ce_coef 0.7 `
+  --masked_ce_coef 0.3
 ```
 
 BC training logs already report:
 
 - `val_loss`
 - `accuracy`
+- `raw_accuracy`
 - `bomb_precision`
 - `bomb_recall`
+- `pred_bomb_rate`
+- `true_bomb_rate`
 - `danger_accuracy`
 - `valuable_accuracy`
 - `illegal_pre_mask_rate`
+- `invalid_action_mass`
 - confusion matrix `6x6`
 
 Minimum sanity checks before moving on:
 
 - `bomb_recall` should not be extremely low
-- `illegal_pre_mask_rate` should stay low
-- confusion matrix should not collapse almost everything into movement-only behavior
+- `pred_bomb_rate` should stay reasonably close to `true_bomb_rate`
+- `illegal_pre_mask_rate` should trend downward, not stay flat and high forever
+- confusion matrix should not collapse almost everything into one move or `PLACE_BOMB`
 
-## Phase 4: Evaluate BC Behavior
+## Phase 5: Evaluate BC Behavior
 
 Run rollout evaluation instead of relying only on offline accuracy:
 
@@ -141,7 +179,7 @@ Optional visual check:
 python scripts/participant/run_local_match.py --agent_paths agent/agent/v6 RandomAgent SimpleRuleAgent SmarterRuleAgent --num_episodes 3 --max_steps 500 --seed 42 --visualize true --autoplay true
 ```
 
-## Phase 5: Main BC Dataset
+## Phase 6: Main BC Dataset
 
 Once smoke is stable, collect the main dataset:
 
@@ -153,7 +191,7 @@ python agent/agent/v6/collect_dataset.py --num_episodes 2500 --scenario selfplay
 python agent/agent/v6/collect_dataset.py --num_episodes 2000 --scenario late --output_dir agent/agent/v6/bc_data_main/late
 ```
 
-## Phase 6: Train BC Main
+## Phase 7: Train BC Main
 
 ```powershell
 python agent/agent/v6/train_bc.py `
@@ -164,7 +202,11 @@ python agent/agent/v6/train_bc.py `
     agent/agent/v6/bc_data_main/selfplay `
     agent/agent/v6/bc_data_main/late `
   --scenario_weight 0.16 0.27 0.27 0.22 0.08 `
-  --epochs 10 --batch_size 64 --seq_len 64 --stride 32
+  --epochs 10 --batch_size 64 --seq_len 64 --stride 32 `
+  --bomb_weight 1.0 `
+  --illegal_action_coef 0.03 `
+  --raw_ce_coef 0.7 `
+  --masked_ce_coef 0.3
 ```
 
 Re-evaluate:
@@ -175,7 +217,7 @@ python agent/agent/v6/eval_bc.py --checkpoint agent/agent/v6/bc_actor.pth --pool
 
 Do not move to PPO unless BC behavior is already reasonable.
 
-## Phase 7: DAgger-lite
+## Phase 8: DAgger-lite
 
 After you have a decent `bc_actor.pth`, collect DAgger-lite data:
 
@@ -195,7 +237,11 @@ python agent/agent/v6/train_bc.py `
     agent/agent/v6/bc_data_main/late `
     agent/agent/v6/bc_data_main/dagger `
   --scenario_weight 0.15 0.24 0.25 0.20 0.06 0.10 `
-  --epochs 10 --batch_size 64 --seq_len 64 --stride 32
+  --epochs 10 --batch_size 64 --seq_len 64 --stride 32 `
+  --bomb_weight 1.0 `
+  --illegal_action_coef 0.03 `
+  --raw_ce_coef 0.7 `
+  --masked_ce_coef 0.3
 ```
 
 The idea is:
@@ -204,7 +250,7 @@ The idea is:
 - tactical teacher still provides the target action labels
 - this reduces BC distribution drift before PPO
 
-## Phase 8: PPO Fine-Tuning
+## Phase 9: PPO Fine-Tuning
 
 Only start PPO when BC already handles the basics:
 
@@ -252,13 +298,14 @@ Do not continue to PPO if BC still shows these:
 ```text
 1. Smoke collect
 2. Smoke analyze
-3. Smoke BC train
-4. Smoke BC eval
-5. Main collect
-6. Main BC train
-7. DAgger-lite collect
-8. BC retrain
-9. PPO fine-tune
+3. BC overfit debug
+4. Smoke BC train
+5. Smoke BC eval
+6. Main collect
+7. Main BC train
+8. DAgger-lite collect
+9. BC retrain
+10. PPO fine-tune
 ```
 
 ## Quick Start Summary
@@ -270,7 +317,7 @@ python agent/agent/v6/collect_dataset.py --num_episodes 200 --scenario farm --ou
 python agent/agent/v6/collect_dataset.py --num_episodes 200 --scenario survive --output_dir agent/agent/v6/bc_data_smoke/survive
 python agent/agent/v6/collect_dataset.py --num_episodes 200 --scenario pressure --output_dir agent/agent/v6/bc_data_smoke/pressure
 python agent/agent/v6/collect_dataset.py --num_episodes 200 --scenario selfplay --output_dir agent/agent/v6/bc_data_smoke/selfplay
-python agent/agent/v6/train_bc.py --data_dir agent/agent/v6/bc_data_smoke/farm agent/agent/v6/bc_data_smoke/survive agent/agent/v6/bc_data_smoke/pressure agent/agent/v6/bc_data_smoke/selfplay --scenario_weight 0.17 0.28 0.30 0.25 --epochs 5 --batch_size 32
+python agent/agent/v6/train_bc.py --data_dir agent/agent/v6/bc_data_smoke/farm agent/agent/v6/bc_data_smoke/survive agent/agent/v6/bc_data_smoke/pressure agent/agent/v6/bc_data_smoke/selfplay --scenario_weight 0.22 0.28 0.30 0.20 --epochs 8 --batch_size 32 --bomb_weight 1.0 --illegal_action_coef 0.03 --raw_ce_coef 0.7 --masked_ce_coef 0.3
 python agent/agent/v6/eval_bc.py --checkpoint agent/agent/v6/bc_actor.pth --pool mixed --num_matches 20
 python agent/agent/v6/train_ppo.py
 ```
