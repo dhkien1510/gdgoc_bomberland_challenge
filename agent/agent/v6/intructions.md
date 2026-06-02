@@ -37,6 +37,11 @@ Artifacts:
 
 Goal: validate the pipeline before collecting a large dataset.
 
+Important:
+
+- Recollect the smoke and main BC shards after the latest BC mask fix.
+- Older shards were saved with a late-stage PPO tactical mask, which is too restrictive for BC and can suppress bomb learning.
+
 Collect a small dataset for 4 scenario blocks:
 
 ```powershell

@@ -31,7 +31,11 @@ from tactical_rule_agent import TacticalRuleAgent
 from bc_model import CNNLSTMBCActor
 from engine.game import BomberEnv
 import _train_base as base
-from model import VALUE_BOMB_MASK_STEPS, prepare_policy_inputs, to_env_action
+from model import prepare_policy_inputs, to_env_action
+
+BC_MASK_CURRENT_STEP = 0
+BC_MASK_WARMUP_STEPS = 10**9
+BC_MASK_VALUE_BOMB_STEPS = 10**9
 
 
 def _load_checkpoint(path: str | Path, map_location):
@@ -63,8 +67,9 @@ class BCAgentEval:
         _, map_feat, aux_feat, action_mask = prepare_policy_inputs(
             obs,
             self.agent_id,
-            current_step=VALUE_BOMB_MASK_STEPS,
-            value_bomb_mask_steps=VALUE_BOMB_MASK_STEPS,
+            current_step=BC_MASK_CURRENT_STEP,
+            warmup_steps=BC_MASK_WARMUP_STEPS,
+            value_bomb_mask_steps=BC_MASK_VALUE_BOMB_STEPS,
             eval_mode=False,
         )
         with torch.no_grad():
@@ -146,7 +151,7 @@ def run_match(checkpoint_path: str, pool_name: str, num_matches: int, seed_base:
                 done,
                 None,
                 episode_ctx,
-                base.get_stage(VALUE_BOMB_MASK_STEPS),
+                base.get_stage(0),
             )
 
         ranks = base.compute_competition_ranks(env.players, death_order, alive_mask)

@@ -31,7 +31,6 @@ from tactical_rule_agent import TacticalRuleAgent
 from bc_model import CNNLSTMBCActor
 from engine.game import BomberEnv
 from model import (
-    VALUE_BOMB_MASK_STEPS,
     build_bomb_state,
     can_hit_enemy_if_place,
     count_boxes_if_place,
@@ -74,7 +73,13 @@ SCENARIOS = {
         "collect_all_perspectives": False,
     },
 }
-MASK_STEP_FOR_BC = VALUE_BOMB_MASK_STEPS
+# BC should learn from permissive action masks rather than the late-stage PPO
+# tactical mask. Otherwise invalid-mass regularization punishes many actions
+# simply because they are "not currently preferred", not because they are
+# physically invalid.
+BC_MASK_CURRENT_STEP = 0
+BC_MASK_WARMUP_STEPS = 10**9
+BC_MASK_VALUE_BOMB_STEPS = 10**9
 
 
 def _load_checkpoint(path: str | Path, map_location):
@@ -117,8 +122,9 @@ class BCPolicyWrapper:
         _, map_feat, aux_feat, action_mask = prepare_policy_inputs(
             obs,
             self.agent_id,
-            current_step=MASK_STEP_FOR_BC,
-            value_bomb_mask_steps=VALUE_BOMB_MASK_STEPS,
+            current_step=BC_MASK_CURRENT_STEP,
+            warmup_steps=BC_MASK_WARMUP_STEPS,
+            value_bomb_mask_steps=BC_MASK_VALUE_BOMB_STEPS,
             eval_mode=False,
         )
         with torch.no_grad():
@@ -201,8 +207,9 @@ def collect_episode_samples(
         canonical_obs, map_feat, aux_feat, action_mask = prepare_policy_inputs(
             obs,
             agent_id,
-            current_step=MASK_STEP_FOR_BC,
-            value_bomb_mask_steps=VALUE_BOMB_MASK_STEPS,
+            current_step=BC_MASK_CURRENT_STEP,
+            warmup_steps=BC_MASK_WARMUP_STEPS,
+            value_bomb_mask_steps=BC_MASK_VALUE_BOMB_STEPS,
             eval_mode=False,
         )
         if not bool(action_mask[canonical_action]):

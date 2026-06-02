@@ -286,7 +286,7 @@ def main():
 
     train_ds = ConcatDataset(train_datasets)
     val_ds = ConcatDataset(val_datasets)
-    train_sampler = make_balanced_concat_sampler(train_datasets, scenario_weights)
+    train_sampler = None if args.overfit_sequences > 0 else make_balanced_concat_sampler(train_datasets, scenario_weights)
 
     print("Scenario sampling plan:")
     total_scenario_weight = sum(scenario_weights)
@@ -300,7 +300,14 @@ def main():
     if args.overfit_sequences > 0:
         print(f"Overfit debug mode: limiting each scenario to <= {args.overfit_sequences} train sequences")
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler, num_workers=0)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        sampler=train_sampler,
+        shuffle=train_sampler is None,
+        num_workers=0,
+    )
+    train_eval_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
     model = CNNLSTMBCActor().to(device)
@@ -361,6 +368,17 @@ def main():
         train_raw_ce = running_raw_ce / max(seen_steps, 1)
         train_masked_ce = running_masked_ce / max(seen_steps, 1)
         train_invalid_mass = running_invalid_mass / max(seen_steps, 1)
+        train_eval_stats = None
+        if args.overfit_sequences > 0:
+            train_eval_stats = evaluate_loader(
+                model,
+                train_eval_loader,
+                device,
+                bomb_weight=args.bomb_weight,
+                raw_ce_coef=args.raw_ce_coef,
+                masked_ce_coef=args.masked_ce_coef,
+                invalid_action_coef=args.illegal_action_coef,
+            )
         val_stats = evaluate_loader(
             model,
             val_loader,
@@ -390,12 +408,27 @@ def main():
             f"raw_ce {train_raw_ce:.4f} | masked_ce {train_masked_ce:.4f} | "
             f"invalid_mass train/val {train_invalid_mass:.4f}/{val_stats['invalid_action_mass']:.4f}"
         )
+        if train_eval_stats is not None:
+            print(
+                f"  -> Overfit train_eval acc/raw {train_eval_stats['accuracy']:.2%}/{train_eval_stats['raw_accuracy']:.2%} | "
+                f"bomb P/R {train_eval_stats['bomb_precision']:.2%}/{train_eval_stats['bomb_recall']:.2%} | "
+                f"bomb pred/true {train_eval_stats['pred_bomb_rate']:.2%}/{train_eval_stats['true_bomb_rate']:.2%} | "
+                f"illegal_pre_mask {train_eval_stats['illegal_before_mask_rate']:.2%} | "
+                f"invalid_mass {train_eval_stats['invalid_action_mass']:.4f}"
+            )
         cm = val_stats["confusion_matrix"]
         cm_rows = " | ".join(
             f"{ACTION_NAMES[row]}:{','.join(str(int(v)) for v in cm[row])}"
             for row in range(cm.shape[0])
         )
         print(f"  -> Confusion {cm_rows}")
+        if train_eval_stats is not None:
+            train_cm = train_eval_stats["confusion_matrix"]
+            train_cm_rows = " | ".join(
+                f"{ACTION_NAMES[row]}:{','.join(str(int(v)) for v in train_cm[row])}"
+                for row in range(train_cm.shape[0])
+            )
+            print(f"  -> Overfit Train Confusion {train_cm_rows}")
 
         if score >= best_score:
             best_score = score
