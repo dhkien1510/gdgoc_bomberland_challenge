@@ -33,6 +33,13 @@ from model import (
 )
 
 
+def _load_checkpoint(path: Path, map_location):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 class Agent:
     def __init__(self, agent_id: int):
         self.agent_id = int(agent_id)
@@ -47,7 +54,7 @@ class Agent:
         if model_path.exists():
             self.mode = "ppo"
             self.model = RecurrentActorCriticV6()
-            checkpoint = torch.load(model_path, map_location=self.device)
+            checkpoint = _load_checkpoint(model_path, map_location=self.device)
             state_dict = checkpoint.get("model", checkpoint) if isinstance(checkpoint, dict) else checkpoint
             self.model.load_state_dict(state_dict)
             self.state = self.model.get_initial_actor_state(1, self.device)
@@ -56,7 +63,7 @@ class Agent:
             self.model = CNNLSTMBCActor()
             if not bc_path.exists():
                 raise FileNotFoundError(f"Neither {model_path} nor {bc_path} exists")
-            self.model.load_state_dict(torch.load(bc_path, map_location=self.device))
+            self.model.load_state_dict(_load_checkpoint(bc_path, map_location=self.device))
             self.state = self.model.get_initial_state(1, self.device)
 
         self.model.to(self.device)

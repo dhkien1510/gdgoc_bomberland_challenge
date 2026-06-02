@@ -19,7 +19,10 @@ def parse_args():
 
 def main():
     args = parse_args()
-    checkpoint = torch.load(args.input, map_location="cpu")
+    try:
+        checkpoint = torch.load(args.input, map_location="cpu", weights_only=True)
+    except TypeError:
+        checkpoint = torch.load(args.input, map_location="cpu")
     state_dict = checkpoint.get("model", checkpoint) if isinstance(checkpoint, dict) else checkpoint
     torch.save(state_dict, args.output)
     print(f"Exported BC actor weights to {args.output}")

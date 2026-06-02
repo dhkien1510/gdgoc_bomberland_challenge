@@ -16,6 +16,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
@@ -26,6 +27,7 @@ sys.modules.pop("_model_v3_base", None)
 sys.modules.pop("_train_base", None)
 
 import _train_base as base
+from bc_model import CNNLSTMBCActor
 from model import RecurrentActorCriticV6, VALUE_BOMB_MASK_STEPS, prepare_policy_inputs, to_env_action
 
 CFG = copy.deepcopy(base.CFG)
@@ -36,6 +38,7 @@ CFG.update(
         "seq_len": 64,
         "batch_size_sequences": 16,
         "ppo_epochs": 4,
+        "bc_coef": 0.1,
         "initial_actor_warmup_steps": 100_000,
         "stage_actor_warmup_steps": 15_000,
         "actor_init_candidates": [
@@ -51,6 +54,13 @@ DEVICE = base.DEVICE
 print(f"Using device: {DEVICE}")
 
 
+def _load_checkpoint(path: str | Path, map_location):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 class SequenceRolloutBuffer:
     def __init__(self):
         self.reset()
@@ -59,18 +69,37 @@ class SequenceRolloutBuffer:
         self.map_feats = []
         self.aux_feats = []
         self.action_masks = []
+        self.actor_h = []
+        self.actor_c = []
         self.actions = []
+        self.bc_teacher_actions = []
         self.log_probs = []
         self.rewards = []
         self.values = []
         self.dones = []
         self.episode_starts = []
 
-    def push(self, map_feat, aux_feat, action_mask, action, log_prob, reward, value, done, episode_start):
+    def push(
+        self,
+        map_feat,
+        aux_feat,
+        action_mask,
+        actor_state,
+        action,
+        bc_teacher_action,
+        log_prob,
+        reward,
+        value,
+        done,
+        episode_start,
+    ):
         self.map_feats.append(map_feat.clone())
         self.aux_feats.append(aux_feat.clone())
         self.action_masks.append(action_mask.clone())
+        self.actor_h.append(actor_state[0].detach().cpu().squeeze(0).clone())
+        self.actor_c.append(actor_state[1].detach().cpu().squeeze(0).clone())
         self.actions.append(int(action))
+        self.bc_teacher_actions.append(int(bc_teacher_action))
         self.log_probs.append(float(log_prob))
         self.rewards.append(float(reward))
         self.values.append(float(value))
@@ -104,20 +133,27 @@ class SequenceRolloutBuffer:
         aux_batch = torch.zeros((batch_size, seq_len, aux_dim), dtype=torch.float32, device=device)
         mask_batch = torch.zeros((batch_size, seq_len, action_dim), dtype=torch.bool, device=device)
         action_batch = torch.zeros((batch_size, seq_len), dtype=torch.long, device=device)
+        bc_teacher_action_batch = torch.zeros((batch_size, seq_len), dtype=torch.long, device=device)
         old_log_prob_batch = torch.zeros((batch_size, seq_len), dtype=torch.float32, device=device)
         adv_batch = torch.zeros((batch_size, seq_len), dtype=torch.float32, device=device)
         ret_batch = torch.zeros((batch_size, seq_len), dtype=torch.float32, device=device)
         loss_mask = torch.zeros((batch_size, seq_len), dtype=torch.float32, device=device)
         episode_start_batch = torch.zeros((batch_size, seq_len), dtype=torch.float32, device=device)
+        hidden_size = self.actor_h[0].shape[0]
+        init_h_batch = torch.zeros((batch_size, hidden_size), dtype=torch.float32, device=device)
+        init_c_batch = torch.zeros((batch_size, hidden_size), dtype=torch.float32, device=device)
 
         for batch_idx, (start, end) in enumerate(windows):
             length = end - start
+            init_h_batch[batch_idx] = self.actor_h[start]
+            init_c_batch[batch_idx] = self.actor_c[start]
             for t in range(length):
                 src = start + t
                 map_batch[batch_idx, t] = self.map_feats[src]
                 aux_batch[batch_idx, t] = self.aux_feats[src]
                 mask_batch[batch_idx, t] = self.action_masks[src]
                 action_batch[batch_idx, t] = self.actions[src]
+                bc_teacher_action_batch[batch_idx, t] = self.bc_teacher_actions[src]
                 old_log_prob_batch[batch_idx, t] = self.log_probs[src]
                 adv_batch[batch_idx, t] = advantages[src]
                 ret_batch[batch_idx, t] = returns[src]
@@ -128,7 +164,10 @@ class SequenceRolloutBuffer:
             "map_feats": map_batch,
             "aux_feats": aux_batch,
             "action_masks": mask_batch,
+            "init_h": init_h_batch,
+            "init_c": init_c_batch,
             "actions": action_batch,
+            "bc_teacher_actions": bc_teacher_action_batch,
             "old_log_probs": old_log_prob_batch,
             "advantages": adv_batch,
             "returns": ret_batch,
@@ -365,13 +404,21 @@ def evaluate_policy(model, current_step: int):
     }
 
 
-def ppo_update(model, optimizer, buffer: SequenceRolloutBuffer, last_value: float, actor_trainable: bool):
+def ppo_update(
+    model,
+    optimizer,
+    buffer: SequenceRolloutBuffer,
+    last_value: float,
+    actor_trainable: bool,
+    bc_coef: float,
+):
     advantages, returns = buffer.compute_gae(last_value, CFG["gamma"], CFG["gae_lambda"])
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
     windows = buffer.make_windows(CFG["seq_len"])
 
     total_pg_loss = 0.0
     total_val_loss = 0.0
+    total_bc_loss = 0.0
     total_entropy = 0.0
     num_updates = 0
 
@@ -386,6 +433,7 @@ def ppo_update(model, optimizer, buffer: SequenceRolloutBuffer, last_value: floa
                 actions=batch["actions"],
                 action_mask_seq=batch["action_masks"],
                 episode_start_mask=batch["episode_starts"],
+                state=(batch["init_h"], batch["init_c"]),
             )
 
             valid = batch["loss_mask"] > 0
@@ -395,12 +443,25 @@ def ppo_update(model, optimizer, buffer: SequenceRolloutBuffer, last_value: floa
                 pg_loss2 = -batch["advantages"] * torch.clamp(ratio, 1 - CFG["clip_eps"], 1 + CFG["clip_eps"])
                 pg_loss = torch.max(pg_loss1, pg_loss2)[valid].mean()
                 entropy_term = CFG["entropy_coef"] * entropy[valid].mean()
+                flat_logits, _ = model.forward_actor_sequence(
+                    batch["map_feats"],
+                    batch["aux_feats"],
+                    action_mask_seq=batch["action_masks"],
+                    episode_start_mask=batch["episode_starts"],
+                    state=(batch["init_h"], batch["init_c"]),
+                )
+                flat_valid = valid.view(-1)
+                bc_loss = F.cross_entropy(
+                    flat_logits.view(-1, flat_logits.shape[-1])[flat_valid],
+                    batch["bc_teacher_actions"].view(-1)[flat_valid],
+                )
             else:
                 pg_loss = torch.zeros((), device=DEVICE)
                 entropy_term = torch.zeros((), device=DEVICE)
+                bc_loss = torch.zeros((), device=DEVICE)
 
             val_loss = 0.5 * ((new_values - batch["returns"]) ** 2)[valid].mean()
-            loss = pg_loss + CFG["value_coef"] * val_loss - entropy_term
+            loss = pg_loss + CFG["value_coef"] * val_loss + bc_coef * bc_loss - entropy_term
 
             optimizer.zero_grad()
             loss.backward()
@@ -409,12 +470,14 @@ def ppo_update(model, optimizer, buffer: SequenceRolloutBuffer, last_value: floa
 
             total_pg_loss += float(pg_loss.item())
             total_val_loss += float(val_loss.item())
+            total_bc_loss += float(bc_loss.item())
             total_entropy += float(entropy[valid].mean().item())
             num_updates += 1
 
     return {
         "pg_loss": total_pg_loss / max(num_updates, 1),
         "val_loss": total_val_loss / max(num_updates, 1),
+        "bc_loss": total_bc_loss / max(num_updates, 1),
         "entropy": total_entropy / max(num_updates, 1),
     }
 
@@ -425,12 +488,23 @@ def train():
     model = RecurrentActorCriticV6().to(DEVICE)
     actor_init_path = resolve_actor_init_path()
     actor_initialized = False
+    bc_reference_path = _HERE / "bc_actor.pth"
+    bc_reference_model = None
     if actor_init_path is not None:
         result = model.load_actor_from_checkpoint(str(actor_init_path))
         actor_initialized = bool(result["loaded_actor"])
         print(f"Actor init from {actor_init_path}: {actor_initialized}")
     else:
         print("Actor init checkpoint not found, starting PPO actor from scratch")
+    if bc_reference_path.exists():
+        checkpoint = _load_checkpoint(bc_reference_path, map_location=DEVICE)
+        state_dict = checkpoint.get("model", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+        bc_reference_model = CNNLSTMBCActor().to(DEVICE)
+        bc_reference_model.load_state_dict(state_dict)
+        bc_reference_model.eval()
+        print(f"Loaded frozen BC reference from {bc_reference_path}")
+    else:
+        print("BC reference checkpoint not found, disabling BC regularization during PPO")
 
     stage_warmup_until = 0
     model.set_actor_trainable(actor_trainable_now(0, actor_initialized, stage_warmup_until))
@@ -458,6 +532,7 @@ def train():
 
     obs, agent_id, opponents, alive_mask, death_order, episode_ctx = base.start_episode(env, pool, global_step)
     actor_state = model.get_initial_actor_state(1, DEVICE)
+    bc_reference_state = None if bc_reference_model is None else bc_reference_model.get_initial_state(1, DEVICE)
     episode_start = True
     actor_trainable = actor_trainable_now(global_step, actor_initialized, stage_warmup_until)
     active_stage_name = base.get_stage(global_step)["name"]
@@ -507,6 +582,7 @@ def train():
             action_mask_batch = action_mask.unsqueeze(0).to(DEVICE)
 
             with torch.no_grad():
+                rollout_actor_state = actor_state
                 action, log_prob, value, next_actor_state = model.act_step(
                     map_feat_batch,
                     aux_feat_batch,
@@ -515,6 +591,18 @@ def train():
                     deterministic=False,
                     episode_start=torch.tensor([float(episode_start)], device=DEVICE),
                 )
+                if bc_reference_model is not None:
+                    bc_teacher_action, bc_reference_state = bc_reference_model.act_step(
+                        map_feat_batch,
+                        aux_feat_batch,
+                        action_mask=action_mask_batch,
+                        state=bc_reference_state,
+                        deterministic=True,
+                        episode_start=torch.tensor([float(episode_start)], device=DEVICE),
+                    )
+                    bc_teacher_action = int(bc_teacher_action.item())
+                else:
+                    bc_teacher_action = int(action.item())
 
             canonical_action = int(action.item())
             env_action = to_env_action(canonical_action, agent_id)
@@ -555,7 +643,9 @@ def train():
                 map_feat.cpu(),
                 aux_feat.cpu(),
                 action_mask.cpu(),
+                rollout_actor_state,
                 canonical_action,
+                bc_teacher_action,
                 float(log_prob.item()),
                 reward,
                 float(value.item()),
@@ -580,6 +670,8 @@ def train():
 
                 obs, agent_id, opponents, alive_mask, death_order, episode_ctx = base.start_episode(env, pool, global_step)
                 actor_state = model.get_initial_actor_state(1, DEVICE)
+                if bc_reference_model is not None:
+                    bc_reference_state = bc_reference_model.get_initial_state(1, DEVICE)
                 episode_start = True
 
         model.train()
@@ -602,7 +694,14 @@ def train():
                 ).item()
             )
 
-        stats = ppo_update(model, optimizer, buffer, last_value, actor_trainable=actor_trainable)
+        stats = ppo_update(
+            model,
+            optimizer,
+            buffer,
+            last_value,
+            actor_trainable=actor_trainable,
+            bc_coef=CFG["bc_coef"] if bc_reference_model is not None else 0.0,
+        )
 
         first_rate = np.mean(first_history) if first_history else 0.0
         bombs_per_episode = np.mean(bombs_per_episode_history) if bombs_per_episode_history else 0.0
@@ -621,7 +720,8 @@ def train():
             f"Bombs {bombs_per_episode:.2f} | VB {valuable_bomb_ratio:.2%} | UB {useless_bomb_ratio:.2%} | "
             f"NEB {no_escape_bomb_ratio:.2%} | Danger {danger_steps_per_episode:.1f} | "
             f"Tiles {unique_tiles_visited:.1f} | Repeat {repeat_position_rate:.2%} | "
-            f"PG {stats['pg_loss']:+.4f} | Val {stats['val_loss']:.4f} | Ent {stats['entropy']:.3f} | SPS {sps:.0f}"
+            f"PG {stats['pg_loss']:+.4f} | Val {stats['val_loss']:.4f} | BC {stats['bc_loss']:.4f} | "
+            f"Ent {stats['entropy']:.3f} | SPS {sps:.0f}"
         )
 
         if global_step - last_save_step >= CFG["save_every"]:

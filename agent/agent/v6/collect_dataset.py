@@ -77,6 +77,13 @@ SCENARIOS = {
 MASK_STEP_FOR_BC = VALUE_BOMB_MASK_STEPS
 
 
+def _load_checkpoint(path: str | Path, map_location):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 def weighted_choice(rng: random.Random, entries):
     total = sum(weight for _item, weight in entries)
     pick = rng.random() * total
@@ -93,7 +100,7 @@ class BCPolicyWrapper:
         self.agent_id = int(agent_id)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = CNNLSTMBCActor()
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = _load_checkpoint(checkpoint_path, map_location=self.device)
         state_dict = checkpoint.get("model", checkpoint) if isinstance(checkpoint, dict) else checkpoint
         self.model.load_state_dict(state_dict)
         self.model.to(self.device)

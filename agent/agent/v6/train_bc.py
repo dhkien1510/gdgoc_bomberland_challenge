@@ -7,12 +7,15 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from bc_dataset import BCSequenceDataset, load_bc_shards, split_episode_keys
 from bc_model import CNNLSTMBCActor
+
+ACTION_NAMES = ["STOP", "LEFT", "RIGHT", "UP", "DOWN", "BOMB"]
 
 
 def parse_args():
@@ -52,6 +55,7 @@ def evaluate_loader(model, loader, device):
     valuable_correct = 0
     valuable_total = 0
     illegal_before_mask = 0
+    confusion = torch.zeros((6, 6), dtype=torch.int64)
 
     class_weights = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 2.0], device=device)
     for batch in loader:
@@ -86,6 +90,10 @@ def evaluate_loader(model, loader, device):
         total_loss += float(loss.item()) * int(valid.sum().item())
         total_steps += int(valid.sum().item())
         total_correct += int(((preds == actions) & valid).sum().item())
+        valid_targets = actions[valid].detach().cpu()
+        valid_preds = preds[valid].detach().cpu()
+        for target, pred in zip(valid_targets.tolist(), valid_preds.tolist()):
+            confusion[target, pred] += 1
 
         pred_bomb = (preds == 5) & valid
         true_bomb = (actions == 5) & valid
@@ -110,6 +118,7 @@ def evaluate_loader(model, loader, device):
         "danger_accuracy": danger_correct / max(danger_total, 1),
         "valuable_accuracy": valuable_correct / max(valuable_total, 1),
         "illegal_before_mask_rate": illegal_before_mask / denom,
+        "confusion_matrix": confusion.numpy(),
     }
 
 
@@ -178,6 +187,12 @@ def main():
             f"danger {val_stats['danger_accuracy']:.2%} | valuable {val_stats['valuable_accuracy']:.2%} | "
             f"illegal_pre_mask {val_stats['illegal_before_mask_rate']:.2%}"
         )
+        cm = val_stats["confusion_matrix"]
+        cm_rows = " | ".join(
+            f"{ACTION_NAMES[row]}:{','.join(str(int(v)) for v in cm[row])}"
+            for row in range(cm.shape[0])
+        )
+        print(f"  -> Confusion {cm_rows}")
 
         if score >= best_score:
             best_score = score

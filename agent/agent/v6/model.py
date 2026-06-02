@@ -57,6 +57,15 @@ from _model_v3_base import (
 from bc_model import CNNLSTMActorCore
 
 
+def _load_checkpoint(path_or_obj, map_location="cpu"):
+    if isinstance(path_or_obj, str):
+        try:
+            return torch.load(path_or_obj, map_location=map_location, weights_only=True)
+        except TypeError:
+            return torch.load(path_or_obj, map_location=map_location)
+    return path_or_obj
+
+
 def _make_critic_encoder():
     return nn.Sequential(
         nn.Conv2d(NUM_CHANNELS, 32, kernel_size=3, padding=1),
@@ -169,8 +178,7 @@ class RecurrentActorCriticV6(nn.Module):
         return self.critic_head(critic_x)
 
     def load_actor_from_checkpoint(self, checkpoint: dict | str):
-        if isinstance(checkpoint, str):
-            checkpoint = torch.load(checkpoint, map_location="cpu")
+        checkpoint = _load_checkpoint(checkpoint, map_location="cpu")
         state_dict = checkpoint.get("model", checkpoint) if isinstance(checkpoint, dict) else checkpoint
         current = self.state_dict()
         remapped = {}

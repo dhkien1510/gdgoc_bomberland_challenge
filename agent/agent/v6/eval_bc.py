@@ -34,12 +34,19 @@ import _train_base as base
 from model import VALUE_BOMB_MASK_STEPS, prepare_policy_inputs, to_env_action
 
 
+def _load_checkpoint(path: str | Path, map_location):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 class BCAgentEval:
     def __init__(self, checkpoint_path: str | Path, agent_id: int, deterministic: bool = True):
         self.agent_id = int(agent_id)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = CNNLSTMBCActor()
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = _load_checkpoint(checkpoint_path, map_location=self.device)
         state_dict = checkpoint.get("model", checkpoint) if isinstance(checkpoint, dict) else checkpoint
         self.model.load_state_dict(state_dict)
         self.model.to(self.device)
@@ -84,10 +91,16 @@ def opponent_pool(name: str):
 def run_match(checkpoint_path: str, pool_name: str, num_matches: int, seed_base: int):
     total_points = 0.0
     total_first = 0.0
+    total_unique_first = 0.0
+    total_shared_first = 0.0
+    total_rank = 0.0
     total_bombs = 0.0
     total_boxes = 0.0
     total_items = 0.0
     total_kills = 0.0
+    total_danger = 0.0
+    total_no_escape = 0.0
+    total_tiles = 0.0
     total_repeat = 0.0
     total_vb = 0.0
     opponents_pool = opponent_pool(pool_name)
@@ -137,23 +150,34 @@ def run_match(checkpoint_path: str, pool_name: str, num_matches: int, seed_base:
             )
 
         ranks = base.compute_competition_ranks(env.players, death_order, alive_mask)
+        first_group_size = sum(1 for rank in ranks if rank == 0)
         final_stats = base.clone_stats(env.players[agent_id])
         metrics = base.summarize_episode_metrics(episode_ctx, final_stats)
 
         total_points += base.RANK_TO_POINTS[ranks[agent_id]]
         total_first += float(ranks[agent_id] == 0)
+        total_unique_first += float(ranks[agent_id] == 0 and first_group_size == 1)
+        total_shared_first += float(ranks[agent_id] == 0 and first_group_size > 1)
+        total_rank += float(ranks[agent_id])
         total_bombs += metrics["bombs_per_episode"]
         total_boxes += metrics["boxes_per_episode"]
         total_items += metrics["items_per_episode"]
         total_kills += metrics["kills_per_episode"]
+        total_danger += metrics["danger_steps_per_episode"]
+        total_no_escape += metrics["no_escape_bomb_ratio"]
+        total_tiles += metrics["unique_tiles_visited"]
         total_repeat += metrics["repeat_position_rate"]
         total_vb += metrics["valuable_bomb_ratio"]
 
     denom = max(num_matches, 1)
     print(
-        f"Pool {pool_name} | points {total_points / denom:.3f} | first {total_first / denom:.2%} | "
-        f"bombs {total_bombs / denom:.2f} | boxes {total_boxes / denom:.2f} | items {total_items / denom:.2f} | "
-        f"kills {total_kills / denom:.2f} | vb {total_vb / denom:.2%} | repeat {total_repeat / denom:.2%}"
+        f"Pool {pool_name} | points {total_points / denom:.3f} | first {total_first / denom:.2%} "
+        f"(unique {total_unique_first / denom:.2%}, shared {total_shared_first / denom:.2%}) | "
+        f"rank {total_rank / denom:.2f} | bombs {total_bombs / denom:.2f} | "
+        f"boxes {total_boxes / denom:.2f} | items {total_items / denom:.2f} | "
+        f"kills {total_kills / denom:.2f} | vb {total_vb / denom:.2%} | "
+        f"no_escape {total_no_escape / denom:.2%} | danger {total_danger / denom:.1f} | "
+        f"tiles {total_tiles / denom:.1f} | repeat {total_repeat / denom:.2%}"
     )
 
 
