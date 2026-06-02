@@ -60,8 +60,8 @@ SCENARIOS = {
     },
     "selfplay": {
         "id": 3,
-        "opponents": [(TacticalRuleAgent, 1.0)],
-        "collect_all_perspectives": True,
+        "opponents": [(GeniusRuleAgent, 0.45), (SmarterRuleAgent, 0.35), (SimpleRuleAgent, 0.20)],
+        "collect_all_perspectives": False,
     },
     "late": {
         "id": 4,
@@ -171,9 +171,7 @@ def build_agents_for_episode(
     teacher_ids = scenario_teacher_ids(scenario_name, rng)
     players = []
     for player_id in range(4):
-        if scenario_name == "selfplay":
-            players.append(TacticalRuleAgent(player_id))
-        elif scenario_name == "dagger" and player_id in teacher_ids and bc_policy_path:
+        if scenario_name == "dagger" and player_id in teacher_ids and bc_policy_path:
             players.append(BCPolicyWrapper(bc_policy_path, player_id))
         elif player_id in teacher_ids:
             players.append(TacticalRuleAgent(player_id))

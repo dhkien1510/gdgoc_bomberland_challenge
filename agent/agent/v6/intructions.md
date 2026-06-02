@@ -233,7 +233,7 @@ Current PPO design:
 - `farm`: early farm, boxes, items, basic bombing
 - `survive`: danger handling, bomb avoidance, survival pressure
 - `pressure`: enemy chase and valuable bomb situations
-- `selfplay`: `TacticalRuleAgent` vs `TacticalRuleAgent` on all 4 seats, collecting all 4 perspectives
+- `selfplay`: one `TacticalRuleAgent` teacher seat against a mixed opponent block of `GeniusRuleAgent` `45%`, `SmarterRuleAgent` `35%`, and `SimpleRuleAgent` `20%`
 - `late`: late-game and harder tactical states
 - `dagger`: learner policy acts part of the time, teacher still labels
 
