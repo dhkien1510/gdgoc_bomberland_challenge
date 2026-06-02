@@ -28,7 +28,9 @@ def parse_args():
     parser.add_argument("--seq_len", type=int, default=64)
     parser.add_argument("--stride", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--bomb_weight", type=float, default=2.0)
+    parser.add_argument("--bomb_weight", type=float, default=1.5)
+    parser.add_argument("--illegal_action_coef", type=float, default=0.1)
+    parser.add_argument("--illegal_margin", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -95,22 +97,44 @@ def masked_ce_loss(logits, targets, loss_mask, class_weights):
     return losses.mean() if losses.numel() > 0 else torch.zeros((), device=logits.device)
 
 
+def illegal_action_margin_loss(raw_logits, action_masks, loss_mask, margin: float):
+    flat_logits = raw_logits.reshape(-1, raw_logits.shape[-1])
+    flat_masks = action_masks.reshape(-1, action_masks.shape[-1]).bool()
+    flat_valid_steps = loss_mask.reshape(-1) > 0
+    if not torch.any(flat_valid_steps):
+        return torch.zeros((), device=raw_logits.device)
+
+    logits = flat_logits[flat_valid_steps]
+    masks = flat_masks[flat_valid_steps]
+    valid_logits = logits.masked_fill(~masks, -1e9)
+    best_valid = valid_logits.max(dim=-1).values
+    invalid_mask = ~masks
+    if not torch.any(invalid_mask):
+        return torch.zeros((), device=raw_logits.device)
+
+    violations = F.relu(logits - best_valid.unsqueeze(-1) + margin)
+    return (violations * invalid_mask).sum() / invalid_mask.sum().clamp_min(1)
+
+
 @torch.no_grad()
-def evaluate_loader(model, loader, device):
+def evaluate_loader(model, loader, device, bomb_weight: float, illegal_margin: float):
     total_loss = 0.0
     total_steps = 0
     total_correct = 0
     bomb_tp = 0
     bomb_fp = 0
     bomb_fn = 0
+    pred_bomb_count = 0
+    true_bomb_count = 0
     danger_correct = 0
     danger_total = 0
     valuable_correct = 0
     valuable_total = 0
     illegal_before_mask = 0
+    illegal_margin_total = 0.0
     confusion = torch.zeros((6, 6), dtype=torch.int64)
 
-    class_weights = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 2.0], device=device)
+    class_weights = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, bomb_weight], device=device)
     for batch in loader:
         map_feats = batch["map_feats"].to(device)
         aux_feats = batch["aux_feats"].to(device)
@@ -137,6 +161,9 @@ def evaluate_loader(model, loader, device):
             episode_start_mask=episode_starts,
         )
         loss = masked_ce_loss(logits, actions, loss_mask, class_weights)
+        illegal_margin_total += float(
+            illegal_action_margin_loss(raw_logits, action_masks, loss_mask, illegal_margin).item()
+        ) * int((loss_mask > 0).sum().item())
         preds = logits.argmax(dim=-1)
         valid = loss_mask > 0
 
@@ -150,6 +177,8 @@ def evaluate_loader(model, loader, device):
 
         pred_bomb = (preds == 5) & valid
         true_bomb = (actions == 5) & valid
+        pred_bomb_count += int(pred_bomb.sum().item())
+        true_bomb_count += int(true_bomb.sum().item())
         bomb_tp += int((pred_bomb & true_bomb).sum().item())
         bomb_fp += int((pred_bomb & ~true_bomb).sum().item())
         bomb_fn += int((~pred_bomb & true_bomb).sum().item())
@@ -168,9 +197,12 @@ def evaluate_loader(model, loader, device):
         "accuracy": total_correct / denom,
         "bomb_precision": bomb_tp / max(bomb_tp + bomb_fp, 1),
         "bomb_recall": bomb_tp / max(bomb_tp + bomb_fn, 1),
+        "pred_bomb_rate": pred_bomb_count / denom,
+        "true_bomb_rate": true_bomb_count / denom,
         "danger_accuracy": danger_correct / max(danger_total, 1),
         "valuable_accuracy": valuable_correct / max(valuable_total, 1),
         "illegal_before_mask_rate": illegal_before_mask / denom,
+        "illegal_margin_loss": illegal_margin_total / denom,
         "confusion_matrix": confusion.numpy(),
     }
 
@@ -217,6 +249,7 @@ def main():
     for epoch in range(1, args.epochs + 1):
         model.train()
         running_loss = 0.0
+        running_illegal_margin = 0.0
         seen_steps = 0
         for batch in train_loader:
             map_feats = batch["map_feats"].to(device)
@@ -226,13 +259,26 @@ def main():
             episode_starts = batch["episode_starts"].to(device)
             loss_mask = batch["loss_mask"].to(device)
 
+            raw_logits, _ = model.forward_sequence(
+                map_feats,
+                aux_feats,
+                action_mask_seq=None,
+                episode_start_mask=episode_starts,
+            )
             logits, _ = model.forward_sequence(
                 map_feats,
                 aux_feats,
                 action_mask_seq=action_masks,
                 episode_start_mask=episode_starts,
             )
-            loss = masked_ce_loss(logits, actions, loss_mask, class_weights)
+            ce_loss = masked_ce_loss(logits, actions, loss_mask, class_weights)
+            illegal_loss = illegal_action_margin_loss(
+                raw_logits,
+                action_masks,
+                loss_mask,
+                margin=args.illegal_margin,
+            )
+            loss = ce_loss + args.illegal_action_coef * illegal_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -240,18 +286,34 @@ def main():
             optimizer.step()
 
             running_loss += float(loss.item()) * int((loss_mask > 0).sum().item())
+            running_illegal_margin += float(illegal_loss.item()) * int((loss_mask > 0).sum().item())
             seen_steps += int((loss_mask > 0).sum().item())
 
         train_loss = running_loss / max(seen_steps, 1)
-        val_stats = evaluate_loader(model, val_loader, device)
-        score = val_stats["accuracy"] + 0.25 * val_stats["bomb_recall"] - 0.2 * val_stats["illegal_before_mask_rate"]
+        train_illegal_margin = running_illegal_margin / max(seen_steps, 1)
+        val_stats = evaluate_loader(
+            model,
+            val_loader,
+            device,
+            bomb_weight=args.bomb_weight,
+            illegal_margin=args.illegal_margin,
+        )
+        score = (
+            val_stats["accuracy"]
+            + 0.20 * val_stats["bomb_recall"]
+            + 0.10 * val_stats["bomb_precision"]
+            - 0.30 * val_stats["illegal_before_mask_rate"]
+            - 0.10 * abs(val_stats["pred_bomb_rate"] - val_stats["true_bomb_rate"])
+        )
 
         print(
             f"Epoch {epoch:>2} | train_loss {train_loss:.4f} | "
             f"val_loss {val_stats['loss']:.4f} | acc {val_stats['accuracy']:.2%} | "
             f"bomb P/R {val_stats['bomb_precision']:.2%}/{val_stats['bomb_recall']:.2%} | "
+            f"bomb pred/true {val_stats['pred_bomb_rate']:.2%}/{val_stats['true_bomb_rate']:.2%} | "
             f"danger {val_stats['danger_accuracy']:.2%} | valuable {val_stats['valuable_accuracy']:.2%} | "
-            f"illegal_pre_mask {val_stats['illegal_before_mask_rate']:.2%}"
+            f"illegal_pre_mask {val_stats['illegal_before_mask_rate']:.2%} | "
+            f"illegal_margin train/val {train_illegal_margin:.4f}/{val_stats['illegal_margin_loss']:.4f}"
         )
         cm = val_stats["confusion_matrix"]
         cm_rows = " | ".join(
