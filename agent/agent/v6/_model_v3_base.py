@@ -1,0 +1,88 @@
+"""
+Version 3 compatibility stack for V5.2 helpers.
+"""
+
+from __future__ import annotations
+
+from _model_base import (
+    ACTION_DELTAS,
+    ACTION_DOWN,
+    ACTION_LEFT,
+    ACTION_PLACE_BOMB,
+    ACTION_RIGHT,
+    ACTION_STOP,
+    ACTION_UP,
+    AUX_DIM,
+    BOMB_TIMER_MAX,
+    GRID_SIZE,
+    MASK_WARMUP_STEPS,
+    VALUE_BOMB_MASK_STEPS,
+    NUM_ACTIONS,
+    NUM_CHANNELS,
+    SAFE_BOMB_HORIZON,
+    CNNActorCriticV2,
+    bfs_first_action_to_targets,
+    build_bomb_state,
+    can_hit_enemy_if_place,
+    canonicalize_obs,
+    clone_obs_with_player_at,
+    count_boxes_if_place,
+    current_tile_danger_time,
+    encode_aux,
+    encode_obs,
+    enemy_same_row_or_col_with_clear_path,
+    has_attack_pressure,
+    has_escape_after_placing_bomb,
+    masked_logits,
+    nearest_enemy_distance,
+    nearest_valuable_bomb_spot_info,
+    prepare_policy_inputs,
+    to_canonical_action,
+    to_env_action,
+    valuable_bomb_spots,
+    valid_action_mask,
+)
+
+
+class CNNActorCriticV3(CNNActorCriticV2):
+    """Compatibility wrapper for older curriculum code."""
+
+
+__all__ = [
+    "ACTION_DELTAS",
+    "ACTION_DOWN",
+    "ACTION_LEFT",
+    "ACTION_PLACE_BOMB",
+    "ACTION_RIGHT",
+    "ACTION_STOP",
+    "ACTION_UP",
+    "AUX_DIM",
+    "BOMB_TIMER_MAX",
+    "CNNActorCriticV3",
+    "GRID_SIZE",
+    "MASK_WARMUP_STEPS",
+    "VALUE_BOMB_MASK_STEPS",
+    "NUM_ACTIONS",
+    "NUM_CHANNELS",
+    "SAFE_BOMB_HORIZON",
+    "bfs_first_action_to_targets",
+    "build_bomb_state",
+    "can_hit_enemy_if_place",
+    "canonicalize_obs",
+    "clone_obs_with_player_at",
+    "count_boxes_if_place",
+    "current_tile_danger_time",
+    "encode_aux",
+    "encode_obs",
+    "enemy_same_row_or_col_with_clear_path",
+    "has_attack_pressure",
+    "has_escape_after_placing_bomb",
+    "masked_logits",
+    "nearest_enemy_distance",
+    "nearest_valuable_bomb_spot_info",
+    "prepare_policy_inputs",
+    "to_canonical_action",
+    "to_env_action",
+    "valuable_bomb_spots",
+    "valid_action_mask",
+]

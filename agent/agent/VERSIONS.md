@@ -6,6 +6,11 @@ Each model version now has its own folder under `agent/agent/`:
 - `v2/`
 - `v3/`
 - `v4_1/`
+- `v4_2/`
+- `v5/`
+- `v5_1/`
+- `v5_2/`
+- `v6/`
 
 Each folder is intended to own its own artifacts:
 

@@ -1,0 +1,133 @@
+"""
+Inference entrypoint for the recurrent BC+PPO agent.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+import sys
+from pathlib import Path
+
+import torch
+
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+sys.modules.pop("model", None)
+sys.modules.pop("_model_base", None)
+sys.modules.pop("_model_v3_base", None)
+
+from bc_model import CNNLSTMBCActor
+from model import (
+    ACTION_PLACE_BOMB,
+    AUX_DIM,
+    MASK_WARMUP_STEPS,
+    NUM_CHANNELS,
+    VALUE_BOMB_MASK_STEPS,
+    RecurrentActorCriticV6,
+    can_hit_enemy_if_place,
+    count_boxes_if_place,
+    nearest_valuable_bomb_spot_info,
+    prepare_policy_inputs,
+    to_env_action,
+)
+
+
+class Agent:
+    def __init__(self, agent_id: int):
+        self.agent_id = int(agent_id)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.current_step = 0
+        self.recent_positions = deque(maxlen=12)
+        self.recent_actions = deque(maxlen=12)
+        self.episode_start = True
+
+        model_path = _HERE / "model.pth"
+        bc_path = _HERE / "bc_actor.pth"
+        if model_path.exists():
+            self.mode = "ppo"
+            self.model = RecurrentActorCriticV6()
+            checkpoint = torch.load(model_path, map_location=self.device)
+            state_dict = checkpoint.get("model", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+            self.model.load_state_dict(state_dict)
+            self.state = self.model.get_initial_actor_state(1, self.device)
+        else:
+            self.mode = "bc"
+            self.model = CNNLSTMBCActor()
+            if not bc_path.exists():
+                raise FileNotFoundError(f"Neither {model_path} nor {bc_path} exists")
+            self.model.load_state_dict(torch.load(bc_path, map_location=self.device))
+            self.state = self.model.get_initial_state(1, self.device)
+
+        self.model.to(self.device)
+        self.model.eval()
+        self._warmup()
+
+    def _warmup(self):
+        dummy_map = torch.zeros(1, NUM_CHANNELS, 13, 13, device=self.device)
+        dummy_aux = torch.zeros(1, AUX_DIM, device=self.device)
+        with torch.no_grad():
+            if self.mode == "ppo":
+                self.model.forward_actor_step(dummy_map, dummy_aux)
+            else:
+                self.model.forward_step(dummy_map, dummy_aux)
+
+    def _is_looping(self) -> bool:
+        if len(self.recent_positions) < 8:
+            return False
+        return len(set(list(self.recent_positions)[-8:])) <= 2
+
+    def act(self, obs: dict) -> int:
+        self.current_step += 1
+        my = obs["players"][self.agent_id]
+        pos = (int(my[0]), int(my[1]))
+        self.recent_positions.append(pos)
+
+        canonical_obs, map_feat, aux_feat, action_mask = prepare_policy_inputs(
+            obs,
+            self.agent_id,
+            current_step=VALUE_BOMB_MASK_STEPS,
+            warmup_steps=MASK_WARMUP_STEPS,
+            value_bomb_mask_steps=VALUE_BOMB_MASK_STEPS,
+            eval_mode=False,
+        )
+        map_feat = map_feat.unsqueeze(0).to(self.device)
+        aux_feat = aux_feat.unsqueeze(0).to(self.device)
+        action_mask = action_mask.unsqueeze(0).to(self.device)
+        episode_start = torch.tensor([self.episode_start], device=self.device)
+
+        with torch.no_grad():
+            if self.mode == "ppo":
+                canonical_action, self.state = self.model.get_action_inference(
+                    map_feat,
+                    aux_feat,
+                    deterministic=True,
+                    action_mask=action_mask,
+                    state=self.state,
+                    episode_start=episode_start,
+                )
+            else:
+                action, self.state = self.model.act_step(
+                    map_feat,
+                    aux_feat,
+                    action_mask=action_mask,
+                    state=self.state,
+                    deterministic=True,
+                    episode_start=episode_start,
+                )
+                canonical_action = int(action.item())
+        self.episode_start = False
+
+        if self._is_looping():
+            if bool(action_mask[0, ACTION_PLACE_BOMB]) and (
+                can_hit_enemy_if_place(canonical_obs, self.agent_id)
+                or count_boxes_if_place(canonical_obs, self.agent_id) > 0
+            ):
+                canonical_action = ACTION_PLACE_BOMB
+            else:
+                first_action, _dist, _count = nearest_valuable_bomb_spot_info(canonical_obs, self.agent_id)
+                if first_action is not None and bool(action_mask[0, int(first_action)]):
+                    canonical_action = int(first_action)
+
+        self.recent_actions.append(int(canonical_action))
+        return int(to_env_action(int(canonical_action), self.agent_id))
