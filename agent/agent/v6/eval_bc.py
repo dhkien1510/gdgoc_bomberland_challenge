@@ -63,6 +63,8 @@ class BCAgentEval:
         self.current_step = 0
         self.recent_positions = deque(maxlen=12)
         self.recent_actions = deque(maxlen=12)
+        self.local_loop_steps = 0
+        self.loop_breaker_triggers = 0
         self.model = CNNLSTMBCActor()
         checkpoint = _load_checkpoint(checkpoint_path, map_location=self.device)
         state_dict = checkpoint.get("model", checkpoint) if isinstance(checkpoint, dict) else checkpoint
@@ -79,6 +81,8 @@ class BCAgentEval:
         self.current_step = 0
         self.recent_positions.clear()
         self.recent_actions.clear()
+        self.local_loop_steps = 0
+        self.loop_breaker_triggers = 0
 
     def _is_looping(self) -> bool:
         if len(self.recent_positions) < 8:
@@ -90,6 +94,9 @@ class BCAgentEval:
         my = obs["players"][self.agent_id]
         pos = (int(my[0]), int(my[1]))
         self.recent_positions.append(pos)
+        is_looping = self._is_looping()
+        if is_looping:
+            self.local_loop_steps += 1
 
         canonical_obs, map_feat, aux_feat, action_mask = prepare_policy_inputs(
             obs,
@@ -111,7 +118,8 @@ class BCAgentEval:
         canonical_action = int(action.item())
         self.episode_start = False
 
-        if self._is_looping():
+        if is_looping:
+            self.loop_breaker_triggers += 1
             if bool(action_mask[ACTION_PLACE_BOMB]) and (
                 can_hit_enemy_if_place(canonical_obs, self.agent_id)
                 or count_boxes_if_place(canonical_obs, self.agent_id) > 0
@@ -124,6 +132,14 @@ class BCAgentEval:
 
         self.recent_actions.append(canonical_action)
         return to_env_action(canonical_action, self.agent_id)
+
+    def summarize_eval_metrics(self) -> dict:
+        steps = max(self.current_step, 1)
+        return {
+            "repeat_position_rate": float(self.local_loop_steps) / steps,
+            "loop_breaker_rate": float(self.loop_breaker_triggers) / steps,
+            "loop_breaker_triggers": float(self.loop_breaker_triggers),
+        }
 
 
 def opponent_pool(name: str):
@@ -148,6 +164,8 @@ def run_match(checkpoint_path: str, pool_name: str, num_matches: int, seed_base:
     total_no_escape = 0.0
     total_tiles = 0.0
     total_repeat = 0.0
+    total_revisit = 0.0
+    total_loop_break = 0.0
     total_vb = 0.0
     opponents_pool = opponent_pool(pool_name)
 
@@ -199,6 +217,7 @@ def run_match(checkpoint_path: str, pool_name: str, num_matches: int, seed_base:
         first_group_size = sum(1 for rank in ranks if rank == 0)
         final_stats = base.clone_stats(env.players[agent_id])
         metrics = base.summarize_episode_metrics(episode_ctx, final_stats)
+        eval_metrics = learners[agent_id].summarize_eval_metrics()
 
         total_points += base.RANK_TO_POINTS[ranks[agent_id]]
         total_first += float(ranks[agent_id] == 0)
@@ -212,7 +231,9 @@ def run_match(checkpoint_path: str, pool_name: str, num_matches: int, seed_base:
         total_danger += metrics["danger_steps_per_episode"]
         total_no_escape += metrics["no_escape_bomb_ratio"]
         total_tiles += metrics["unique_tiles_visited"]
-        total_repeat += metrics["repeat_position_rate"]
+        total_repeat += eval_metrics["repeat_position_rate"]
+        total_revisit += metrics["repeat_position_rate"]
+        total_loop_break += eval_metrics["loop_breaker_rate"]
         total_vb += metrics["valuable_bomb_ratio"]
 
     denom = max(num_matches, 1)
@@ -223,7 +244,8 @@ def run_match(checkpoint_path: str, pool_name: str, num_matches: int, seed_base:
         f"boxes {total_boxes / denom:.2f} | items {total_items / denom:.2f} | "
         f"kills {total_kills / denom:.2f} | vb {total_vb / denom:.2%} | "
         f"no_escape {total_no_escape / denom:.2%} | danger {total_danger / denom:.1f} | "
-        f"tiles {total_tiles / denom:.1f} | repeat {total_repeat / denom:.2%}"
+        f"tiles {total_tiles / denom:.1f} | repeat {total_repeat / denom:.2%} | "
+        f"revisit {total_revisit / denom:.2%} | loop_break {total_loop_break / denom:.2%}"
     )
 
 
