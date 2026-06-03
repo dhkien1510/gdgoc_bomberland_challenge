@@ -5,6 +5,7 @@ Rollout evaluation for the BC actor before PPO fine-tuning.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import importlib.util
 import random
 import sys
@@ -40,10 +41,12 @@ import _train_base as base
 
 prepare_policy_inputs = _MODEL.prepare_policy_inputs
 to_env_action = _MODEL.to_env_action
-
-BC_MASK_CURRENT_STEP = 0
-BC_MASK_WARMUP_STEPS = 10**9
-BC_MASK_VALUE_BOMB_STEPS = 10**9
+ACTION_PLACE_BOMB = _MODEL.ACTION_PLACE_BOMB
+MASK_WARMUP_STEPS = _MODEL.MASK_WARMUP_STEPS
+VALUE_BOMB_MASK_STEPS = _MODEL.VALUE_BOMB_MASK_STEPS
+can_hit_enemy_if_place = _MODEL.can_hit_enemy_if_place
+count_boxes_if_place = _MODEL.count_boxes_if_place
+nearest_valuable_bomb_spot_info = _MODEL.nearest_valuable_bomb_spot_info
 
 
 def _load_checkpoint(path: str | Path, map_location):
@@ -57,6 +60,9 @@ class BCAgentEval:
     def __init__(self, checkpoint_path: str | Path, agent_id: int, deterministic: bool = True):
         self.agent_id = int(agent_id)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.current_step = 0
+        self.recent_positions = deque(maxlen=12)
+        self.recent_actions = deque(maxlen=12)
         self.model = CNNLSTMBCActor()
         checkpoint = _load_checkpoint(checkpoint_path, map_location=self.device)
         state_dict = checkpoint.get("model", checkpoint) if isinstance(checkpoint, dict) else checkpoint
@@ -70,14 +76,27 @@ class BCAgentEval:
     def reset(self):
         self.state = self.model.get_initial_state(1, self.device)
         self.episode_start = True
+        self.current_step = 0
+        self.recent_positions.clear()
+        self.recent_actions.clear()
+
+    def _is_looping(self) -> bool:
+        if len(self.recent_positions) < 8:
+            return False
+        return len(set(list(self.recent_positions)[-8:])) <= 2
 
     def act(self, obs):
-        _, map_feat, aux_feat, action_mask = prepare_policy_inputs(
+        self.current_step += 1
+        my = obs["players"][self.agent_id]
+        pos = (int(my[0]), int(my[1]))
+        self.recent_positions.append(pos)
+
+        canonical_obs, map_feat, aux_feat, action_mask = prepare_policy_inputs(
             obs,
             self.agent_id,
-            current_step=BC_MASK_CURRENT_STEP,
-            warmup_steps=BC_MASK_WARMUP_STEPS,
-            value_bomb_mask_steps=BC_MASK_VALUE_BOMB_STEPS,
+            current_step=VALUE_BOMB_MASK_STEPS,
+            warmup_steps=MASK_WARMUP_STEPS,
+            value_bomb_mask_steps=VALUE_BOMB_MASK_STEPS,
             eval_mode=False,
         )
         with torch.no_grad():
@@ -89,8 +108,22 @@ class BCAgentEval:
                 deterministic=self.deterministic,
                 episode_start=torch.tensor([self.episode_start], device=self.device),
             )
+        canonical_action = int(action.item())
         self.episode_start = False
-        return to_env_action(int(action.item()), self.agent_id)
+
+        if self._is_looping():
+            if bool(action_mask[ACTION_PLACE_BOMB]) and (
+                can_hit_enemy_if_place(canonical_obs, self.agent_id)
+                or count_boxes_if_place(canonical_obs, self.agent_id) > 0
+            ):
+                canonical_action = ACTION_PLACE_BOMB
+            else:
+                first_action, _dist, _count = nearest_valuable_bomb_spot_info(canonical_obs, self.agent_id)
+                if first_action is not None and bool(action_mask[int(first_action)]):
+                    canonical_action = int(first_action)
+
+        self.recent_actions.append(canonical_action)
+        return to_env_action(canonical_action, self.agent_id)
 
 
 def opponent_pool(name: str):
