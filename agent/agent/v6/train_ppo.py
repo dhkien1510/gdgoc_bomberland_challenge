@@ -128,6 +128,22 @@ def _load_checkpoint(path: str | Path, map_location):
         return torch.load(path, map_location=map_location)
 
 
+def _try_load_optimizer_state(optimizer: optim.Optimizer, optimizer_state) -> bool:
+    if optimizer_state is None:
+        return False
+    saved_groups = optimizer_state.get("param_groups")
+    if not isinstance(saved_groups, list):
+        return False
+    current_groups = optimizer.param_groups
+    if len(saved_groups) != len(current_groups):
+        return False
+    try:
+        optimizer.load_state_dict(optimizer_state)
+    except ValueError:
+        return False
+    return True
+
+
 def sync_group_lrs(optimizer: optim.Optimizer, global_step: int):
     frac = max(1.0 - (global_step / CFG["total_steps"]), 0.05)
     for group in optimizer.param_groups:
@@ -662,8 +678,7 @@ def train():
             )
         model.load_state_dict(resume_payload["model"])
         optimizer_state = resume_payload.get("optimizer")
-        if optimizer_state is not None:
-            optimizer.load_state_dict(optimizer_state)
+        optimizer_loaded = _try_load_optimizer_state(optimizer, optimizer_state)
         global_step = int(resume_payload.get("global_step", 0))
         actor_initialized = bool(resume_payload.get("actor_initialized", True))
         stage_warmup_until = int(resume_payload.get("stage_warmup_until", 0))
@@ -681,6 +696,11 @@ def train():
         )
         if optimizer_state is None:
             print("Resume checkpoint had no optimizer state; continuing with a fresh optimizer")
+        elif not optimizer_loaded:
+            print(
+                "Resume checkpoint optimizer state is incompatible with the current optimizer groups; "
+                "continuing with a fresh optimizer"
+            )
 
     model.set_actor_trainable(actor_trainable_now(global_step, actor_initialized, stage_warmup_until))
     pool = ActiveOpponentPoolV6(
