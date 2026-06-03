@@ -5,6 +5,7 @@ Rollout evaluation for the BC actor before PPO fine-tuning.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import random
 import sys
 from pathlib import Path
@@ -22,6 +23,11 @@ if str(ROOT) not in sys.path:
 if str(BASELINE_DIR) not in sys.path:
     sys.path.insert(0, str(BASELINE_DIR))
 
+_MODEL_SPEC = importlib.util.spec_from_file_location("_v6_model_eval", _HERE / "model.py")
+_MODEL = importlib.util.module_from_spec(_MODEL_SPEC)
+assert _MODEL_SPEC.loader is not None
+_MODEL_SPEC.loader.exec_module(_MODEL)
+
 from box_farmer_agent import BoxFarmerAgent
 from genius_rule_agent import GeniusRuleAgent
 from random_agent import RandomAgent
@@ -31,7 +37,9 @@ from tactical_rule_agent import TacticalRuleAgent
 from bc_model import CNNLSTMBCActor
 from engine.game import BomberEnv
 import _train_base as base
-from model import prepare_policy_inputs, to_env_action
+
+prepare_policy_inputs = _MODEL.prepare_policy_inputs
+to_env_action = _MODEL.to_env_action
 
 BC_MASK_CURRENT_STEP = 0
 BC_MASK_WARMUP_STEPS = 10**9

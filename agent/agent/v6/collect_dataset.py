@@ -5,6 +5,7 @@ Scenario-based BC dataset collector using v5.2 preprocessing.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import random
 import sys
 from pathlib import Path
@@ -22,6 +23,11 @@ if str(ROOT) not in sys.path:
 if str(BASELINE_DIR) not in sys.path:
     sys.path.insert(0, str(BASELINE_DIR))
 
+_MODEL_SPEC = importlib.util.spec_from_file_location("_v6_model_collect", _HERE / "model.py")
+_MODEL = importlib.util.module_from_spec(_MODEL_SPEC)
+assert _MODEL_SPEC.loader is not None
+_MODEL_SPEC.loader.exec_module(_MODEL)
+
 from box_farmer_agent import BoxFarmerAgent
 from genius_rule_agent import GeniusRuleAgent
 from random_agent import RandomAgent
@@ -30,16 +36,15 @@ from smarter_rule_agent import SmarterRuleAgent
 from tactical_rule_agent import TacticalRuleAgent
 from bc_model import CNNLSTMBCActor
 from engine.game import BomberEnv
-from model import (
-    build_bomb_state,
-    can_hit_enemy_if_place,
-    count_boxes_if_place,
-    current_tile_danger_time,
-    has_escape_after_placing_bomb,
-    prepare_policy_inputs,
-    to_canonical_action,
-    to_env_action,
-)
+
+build_bomb_state = _MODEL.build_bomb_state
+can_hit_enemy_if_place = _MODEL.can_hit_enemy_if_place
+count_boxes_if_place = _MODEL.count_boxes_if_place
+current_tile_danger_time = _MODEL.current_tile_danger_time
+has_escape_after_placing_bomb = _MODEL.has_escape_after_placing_bomb
+prepare_policy_inputs = _MODEL.prepare_policy_inputs
+to_canonical_action = _MODEL.to_canonical_action
+to_env_action = _MODEL.to_env_action
 
 SCENARIOS = {
     "farm": {

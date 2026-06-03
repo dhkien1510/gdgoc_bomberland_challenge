@@ -29,6 +29,11 @@ def parse_args():
     parser.add_argument("--seq_len", type=int, default=64)
     parser.add_argument("--stride", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--head_warmup_epochs", type=int, default=0)
+    parser.add_argument("--head_warmup_lr", type=float, default=1e-2)
+    parser.add_argument("--backbone_lr", type=float, default=3e-5)
+    parser.add_argument("--finetune_lr", type=float, default=1e-4)
+    parser.add_argument("--finetune_patience", type=int, default=0)
     parser.add_argument("--bomb_weight", type=float, default=1.0)
     parser.add_argument("--raw_ce_coef", type=float, default=0.7)
     parser.add_argument("--masked_ce_coef", type=float, default=0.3)
@@ -151,6 +156,36 @@ def invalid_action_mass_loss(raw_logits, action_masks, loss_mask):
     masks = flat_masks[flat_valid_steps]
     invalid_mass = (probs * (~masks).float()).sum(dim=-1)
     return invalid_mass.mean()
+
+
+def configure_train_phase(model: CNNLSTMBCActor, args, epoch: int, current_phase: str | None):
+    warmup_active = args.head_warmup_epochs > 0 and epoch <= args.head_warmup_epochs
+    next_phase = "head_warmup" if warmup_active else "finetune"
+    if next_phase == current_phase:
+        return current_phase, None
+
+    if next_phase == "head_warmup":
+        for param in model.actor_core.parameters():
+            param.requires_grad = False
+        for param in model.actor_head.parameters():
+            param.requires_grad = True
+        optimizer = torch.optim.Adam(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=args.head_warmup_lr,
+        )
+    else:
+        for param in model.actor_core.parameters():
+            param.requires_grad = True
+        for param in model.actor_head.parameters():
+            param.requires_grad = True
+        optimizer = torch.optim.Adam(
+            [
+                {"params": model.actor_core.parameters(), "lr": args.backbone_lr},
+                {"params": model.actor_head.parameters(), "lr": args.finetune_lr},
+            ]
+        )
+
+    return next_phase, optimizer
 
 
 @torch.no_grad()
@@ -307,18 +342,66 @@ def main():
         shuffle=train_sampler is None,
         num_workers=0,
     )
+    if args.overfit_sequences > 0:
+        print("\nDEBUG first 5 train batches:")
+
+        for bi, batch in zip(range(5), train_loader):
+            actions = batch["actions"]
+            loss_mask = batch["loss_mask"] > 0
+
+            counts = torch.bincount(
+                actions[loss_mask].reshape(-1).cpu(),
+                minlength=6,
+            )
+
+            print(
+                f"batch {bi} | "
+                f"valid={int(loss_mask.sum().item())} | "
+                f"action_counts={counts.tolist()}"
+            )
+
+        print("DEBUG end first 5 train batches\n")
+
     train_eval_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
     model = CNNLSTMBCActor().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    if args.head_warmup_epochs <= 0 and args.lr != 3e-4:
+        warnings.warn(
+            "--lr is ignored unless --head_warmup_epochs=0 and legacy single-phase training is restored. "
+            "Use --head_warmup_lr, --backbone_lr, and --finetune_lr instead.",
+            stacklevel=2,
+        )
     class_weights = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, args.bomb_weight], device=device)
 
     best_score = float("-inf")
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    head_warmup_output_path = output_path.with_name(f"{output_path.stem}_head_warmup{output_path.suffix}")
+    finetune_output_path = output_path.with_name(f"{output_path.stem}_finetune{output_path.suffix}")
+    phase_name = None
+    optimizer = None
+    best_phase_scores = {
+        "head_warmup": float("-inf"),
+        "finetune": float("-inf"),
+    }
+    best_phase_epochs = {
+        "head_warmup": None,
+        "finetune": None,
+    }
+    finetune_epochs_without_improve = 0
 
     for epoch in range(1, args.epochs + 1):
+        phase_name, maybe_optimizer = configure_train_phase(model, args, epoch, phase_name)
+        if maybe_optimizer is not None:
+            optimizer = maybe_optimizer
+            print(
+                f"Entering phase: {phase_name} | "
+                f"head_warmup_epochs={args.head_warmup_epochs} | "
+                f"head_warmup_lr={args.head_warmup_lr:.2e} | "
+                f"backbone_lr={args.backbone_lr:.2e} | finetune_lr={args.finetune_lr:.2e}"
+            )
+
         model.train()
         running_loss = 0.0
         running_raw_ce = 0.0
@@ -399,7 +482,7 @@ def main():
         )
 
         print(
-            f"Epoch {epoch:>2} | train_loss {train_loss:.4f} | "
+            f"Epoch {epoch:>2} | phase {phase_name} | train_loss {train_loss:.4f} | "
             f"val_loss {val_stats['loss']:.4f} | acc/raw {val_stats['accuracy']:.2%}/{val_stats['raw_accuracy']:.2%} | "
             f"bomb P/R {val_stats['bomb_precision']:.2%}/{val_stats['bomb_recall']:.2%} | "
             f"bomb pred/true {val_stats['pred_bomb_rate']:.2%}/{val_stats['true_bomb_rate']:.2%} | "
@@ -430,10 +513,45 @@ def main():
             )
             print(f"  -> Overfit Train Confusion {train_cm_rows}")
 
+        phase_best_path = head_warmup_output_path if phase_name == "head_warmup" else finetune_output_path
+        if score >= best_phase_scores[phase_name]:
+            best_phase_scores[phase_name] = score
+            best_phase_epochs[phase_name] = epoch
+            torch.save(model.state_dict(), phase_best_path)
+            print(
+                f"  -> saved best {phase_name} checkpoint to {phase_best_path} "
+                f"(epoch {epoch}, score {score:.6f})"
+            )
+            if phase_name == "finetune":
+                finetune_epochs_without_improve = 0
+        elif phase_name == "finetune":
+            finetune_epochs_without_improve += 1
+
         if score >= best_score:
             best_score = score
             torch.save(model.state_dict(), output_path)
             print(f"  -> saved best BC actor to {output_path}")
+
+        if (
+            phase_name == "finetune"
+            and args.finetune_patience > 0
+            and finetune_epochs_without_improve >= args.finetune_patience
+        ):
+            print(
+                f"Early stopping finetune after {finetune_epochs_without_improve} non-improving epochs | "
+                f"best_finetune_epoch={best_phase_epochs['finetune']} "
+                f"best_finetune_score={best_phase_scores['finetune']:.6f}"
+            )
+            break
+
+    print(
+        "Training summary | "
+        f"best_head_warmup_epoch={best_phase_epochs['head_warmup']} "
+        f"best_head_warmup_score={best_phase_scores['head_warmup']:.6f} | "
+        f"best_finetune_epoch={best_phase_epochs['finetune']} "
+        f"best_finetune_score={best_phase_scores['finetune']:.6f} | "
+        f"best_overall_score={best_score:.6f}"
+    )
 
 
 if __name__ == "__main__":
