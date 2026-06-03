@@ -4,6 +4,7 @@ Recurrent PPO fine-tuning for the v6 BC+PPO agent.
 
 from __future__ import annotations
 
+import argparse
 import copy
 import importlib.util
 import os
@@ -62,6 +63,47 @@ CFG.update(
 
 DEVICE = base.DEVICE
 print(f"Using device: {DEVICE}")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--total_steps", type=int, default=CFG["total_steps"])
+    parser.add_argument("--save_every", type=int, default=CFG["save_every"])
+    parser.add_argument("--n_steps", type=int, default=CFG["n_steps"])
+    parser.add_argument("--seq_len", type=int, default=CFG["seq_len"])
+    parser.add_argument("--batch_size_sequences", type=int, default=CFG["batch_size_sequences"])
+    parser.add_argument("--ppo_epochs", type=int, default=CFG["ppo_epochs"])
+    parser.add_argument("--bc_coef", type=float, default=CFG["bc_coef"])
+    parser.add_argument("--entropy_coef", type=float, default=CFG["entropy_coef"])
+    parser.add_argument("--initial_actor_warmup_steps", type=int, default=CFG["initial_actor_warmup_steps"])
+    parser.add_argument("--stage_actor_warmup_steps", type=int, default=CFG["stage_actor_warmup_steps"])
+    parser.add_argument("--eval_easy_medium_matches", type=int, default=CFG["eval_easy_medium_matches"])
+    parser.add_argument("--eval_hard_matches", type=int, default=CFG["eval_hard_matches"])
+    parser.add_argument("--ckpt_dir", type=str, default=CFG["ckpt_dir"])
+    return parser.parse_args()
+
+
+def apply_cli_overrides(args):
+    CFG["total_steps"] = int(args.total_steps)
+    CFG["save_every"] = int(args.save_every)
+    CFG["n_steps"] = int(args.n_steps)
+    CFG["seq_len"] = int(args.seq_len)
+    CFG["batch_size_sequences"] = int(args.batch_size_sequences)
+    CFG["ppo_epochs"] = int(args.ppo_epochs)
+    CFG["bc_coef"] = float(args.bc_coef)
+    CFG["entropy_coef"] = float(args.entropy_coef)
+    CFG["initial_actor_warmup_steps"] = int(args.initial_actor_warmup_steps)
+    CFG["stage_actor_warmup_steps"] = int(args.stage_actor_warmup_steps)
+    CFG["eval_easy_medium_matches"] = int(args.eval_easy_medium_matches)
+    CFG["eval_hard_matches"] = int(args.eval_hard_matches)
+    CFG["ckpt_dir"] = str(args.ckpt_dir)
+    if CFG["initial_actor_warmup_steps"] >= CFG["total_steps"]:
+        print(
+            "Warning: initial_actor_warmup_steps >= total_steps; "
+            "the actor may stay frozen for the whole run."
+        )
+    if CFG["save_every"] > CFG["total_steps"]:
+        print("Warning: save_every > total_steps; only the final model may be saved.")
 
 
 def _load_checkpoint(path: str | Path, map_location):
@@ -786,4 +828,6 @@ def train():
 
 
 if __name__ == "__main__":
+    args = parse_args()
+    apply_cli_overrides(args)
     train()
