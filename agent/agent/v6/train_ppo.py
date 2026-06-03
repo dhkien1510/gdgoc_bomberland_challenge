@@ -80,6 +80,8 @@ def parse_args():
     parser.add_argument("--eval_easy_medium_matches", type=int, default=CFG["eval_easy_medium_matches"])
     parser.add_argument("--eval_hard_matches", type=int, default=CFG["eval_hard_matches"])
     parser.add_argument("--ckpt_dir", type=str, default=CFG["ckpt_dir"])
+    parser.add_argument("--actor_init_path", type=str, default="")
+    parser.add_argument("--bc_reference_path", type=str, default=str(_HERE / "bc_actor.pth"))
     return parser.parse_args()
 
 
@@ -97,6 +99,8 @@ def apply_cli_overrides(args):
     CFG["eval_easy_medium_matches"] = int(args.eval_easy_medium_matches)
     CFG["eval_hard_matches"] = int(args.eval_hard_matches)
     CFG["ckpt_dir"] = str(args.ckpt_dir)
+    CFG["actor_init_path"] = str(args.actor_init_path).strip()
+    CFG["bc_reference_path"] = str(args.bc_reference_path).strip()
     if CFG["initial_actor_warmup_steps"] >= CFG["total_steps"]:
         print(
             "Warning: initial_actor_warmup_steps >= total_steps; "
@@ -260,6 +264,10 @@ class ModelOpponentV6:
 
 
 def resolve_actor_init_path() -> Path | None:
+    explicit = str(CFG.get("actor_init_path", "")).strip()
+    if explicit:
+        path = Path(explicit)
+        return path if path.exists() else None
     for candidate in CFG["actor_init_candidates"]:
         path = Path(candidate)
         if path.exists():
@@ -540,7 +548,7 @@ def train():
     model = RecurrentActorCriticV6().to(DEVICE)
     actor_init_path = resolve_actor_init_path()
     actor_initialized = False
-    bc_reference_path = _HERE / "bc_actor.pth"
+    bc_reference_path = Path(str(CFG.get("bc_reference_path", _HERE / "bc_actor.pth")))
     bc_reference_model = None
     if actor_init_path is not None:
         result = model.load_actor_from_checkpoint(str(actor_init_path))

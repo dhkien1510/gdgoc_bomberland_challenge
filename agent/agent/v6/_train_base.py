@@ -69,6 +69,29 @@ RANK_TO_POINTS = _BASE.RANK_TO_POINTS
 print(f"Using device: {DEVICE}")
 
 CURRICULUM_STAGES = copy.deepcopy(_BASE.CURRICULUM_STAGES)
+CURRICULUM_STAGES[1]["end_step"] = 500_000
+CURRICULUM_STAGES[1]["baseline_bots"] = [
+    (SimpleRuleAgent, 0.4),
+    (SmarterRuleAgent, 0.6),
+]
+CURRICULUM_STAGES[1]["reward"].update(
+    {
+        "r_death": -0.55,
+        "r_kill": 0.6,
+        "r_box_destroy": 0.05,
+        "r_item_collect": 0.06,
+        "r_best_enemy_dist": 0.03,
+        "r_danger_critical": -0.20,
+        "r_danger_soon": -0.08,
+        "r_danger_far": -0.02,
+        "r_escape_danger": 0.03,
+        "r_valuable_bomb_enemy": 0.18,
+        "r_valuable_bomb_box": 0.03,
+        "r_useless_bomb": -0.12,
+        "r_no_escape_bomb": -0.50,
+        "rank_rewards": {0: 1.0, 1: 0.2, 2: -0.2, 3: -0.8},
+    }
+)
 CURRICULUM_STAGES[0]["reward"].update(
     {
         "r_move_closer_bomb_spot": 0.006,
@@ -79,10 +102,10 @@ CURRICULUM_STAGES[0]["reward"].update(
 )
 CURRICULUM_STAGES[1]["reward"].update(
     {
-        "r_move_closer_bomb_spot": 0.004,
-        "r_move_away_bomb_spot": -0.002,
-        "r_best_bomb_spot_dist": 0.015,
-        "r_position_loop": -0.025,
+        "r_move_closer_bomb_spot": 0.002,
+        "r_move_away_bomb_spot": -0.001,
+        "r_best_bomb_spot_dist": 0.008,
+        "r_position_loop": -0.03,
     }
 )
 CURRICULUM_STAGES[2]["reward"].update(
