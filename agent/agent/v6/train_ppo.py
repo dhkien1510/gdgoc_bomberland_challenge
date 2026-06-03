@@ -50,6 +50,9 @@ CFG.update(
         "batch_size_sequences": 16,
         "ppo_epochs": 4,
         "bc_coef": 0.1,
+        "actor_core_lr": 5.0e-5,
+        "actor_head_lr": 1.0e-4,
+        "critic_lr": base.CFG["lr"],
         "initial_actor_warmup_steps": 100_000,
         "stage_actor_warmup_steps": 15_000,
         "actor_init_candidates": [
@@ -75,6 +78,9 @@ def parse_args():
     parser.add_argument("--ppo_epochs", type=int, default=CFG["ppo_epochs"])
     parser.add_argument("--bc_coef", type=float, default=CFG["bc_coef"])
     parser.add_argument("--entropy_coef", type=float, default=CFG["entropy_coef"])
+    parser.add_argument("--actor_core_lr", type=float, default=CFG["actor_core_lr"])
+    parser.add_argument("--actor_head_lr", type=float, default=CFG["actor_head_lr"])
+    parser.add_argument("--critic_lr", type=float, default=CFG["critic_lr"])
     parser.add_argument("--initial_actor_warmup_steps", type=int, default=CFG["initial_actor_warmup_steps"])
     parser.add_argument("--stage_actor_warmup_steps", type=int, default=CFG["stage_actor_warmup_steps"])
     parser.add_argument("--eval_easy_medium_matches", type=int, default=CFG["eval_easy_medium_matches"])
@@ -95,6 +101,9 @@ def apply_cli_overrides(args):
     CFG["ppo_epochs"] = int(args.ppo_epochs)
     CFG["bc_coef"] = float(args.bc_coef)
     CFG["entropy_coef"] = float(args.entropy_coef)
+    CFG["actor_core_lr"] = float(args.actor_core_lr)
+    CFG["actor_head_lr"] = float(args.actor_head_lr)
+    CFG["critic_lr"] = float(args.critic_lr)
     CFG["initial_actor_warmup_steps"] = int(args.initial_actor_warmup_steps)
     CFG["stage_actor_warmup_steps"] = int(args.stage_actor_warmup_steps)
     CFG["eval_easy_medium_matches"] = int(args.eval_easy_medium_matches)
@@ -117,6 +126,13 @@ def _load_checkpoint(path: str | Path, map_location):
         return torch.load(path, map_location=map_location, weights_only=True)
     except TypeError:
         return torch.load(path, map_location=map_location)
+
+
+def sync_group_lrs(optimizer: optim.Optimizer, global_step: int):
+    frac = max(1.0 - (global_step / CFG["total_steps"]), 0.05)
+    for group in optimizer.param_groups:
+        base_lr = float(group.get("base_lr", CFG["critic_lr"]))
+        group["lr"] = base_lr * frac
 
 
 class SequenceRolloutBuffer:
@@ -490,6 +506,11 @@ def ppo_update(
     total_val_loss = 0.0
     total_bc_loss = 0.0
     total_entropy = 0.0
+    total_approx_kl = 0.0
+    total_clip_fraction = 0.0
+    total_ratio_mean = 0.0
+    total_ratio_std = 0.0
+    total_explained_variance = 0.0
     num_updates = 0
 
     for _ in range(CFG["ppo_epochs"]):
@@ -507,12 +528,24 @@ def ppo_update(
             )
 
             valid = batch["loss_mask"] > 0
+            valid_returns = batch["returns"][valid]
+            valid_values = new_values[valid]
+            returns_var = torch.var(valid_returns, unbiased=False)
+            if float(returns_var.item()) > 1e-8:
+                explained_variance = 1.0 - torch.var(valid_returns - valid_values, unbiased=False) / returns_var
+            else:
+                explained_variance = torch.zeros((), device=DEVICE)
             if actor_trainable:
                 ratio = torch.exp(new_log_probs - batch["old_log_probs"])
+                ratio_valid = ratio[valid]
                 pg_loss1 = -batch["advantages"] * ratio
                 pg_loss2 = -batch["advantages"] * torch.clamp(ratio, 1 - CFG["clip_eps"], 1 + CFG["clip_eps"])
                 pg_loss = torch.max(pg_loss1, pg_loss2)[valid].mean()
                 entropy_term = CFG["entropy_coef"] * entropy[valid].mean()
+                approx_kl = (batch["old_log_probs"][valid] - new_log_probs[valid]).mean()
+                clip_fraction = ((ratio_valid - 1.0).abs() > CFG["clip_eps"]).float().mean()
+                ratio_mean = ratio_valid.mean()
+                ratio_std = ratio_valid.std(unbiased=False)
                 flat_logits, _ = model.forward_actor_sequence(
                     batch["map_feats"],
                     batch["aux_feats"],
@@ -529,6 +562,10 @@ def ppo_update(
                 pg_loss = torch.zeros((), device=DEVICE)
                 entropy_term = torch.zeros((), device=DEVICE)
                 bc_loss = torch.zeros((), device=DEVICE)
+                approx_kl = torch.zeros((), device=DEVICE)
+                clip_fraction = torch.zeros((), device=DEVICE)
+                ratio_mean = torch.zeros((), device=DEVICE)
+                ratio_std = torch.zeros((), device=DEVICE)
 
             val_loss = 0.5 * ((new_values - batch["returns"]) ** 2)[valid].mean()
             loss = pg_loss + CFG["value_coef"] * val_loss + bc_coef * bc_loss - entropy_term
@@ -542,6 +579,11 @@ def ppo_update(
             total_val_loss += float(val_loss.item())
             total_bc_loss += float(bc_loss.item())
             total_entropy += float(entropy[valid].mean().item())
+            total_approx_kl += float(approx_kl.item())
+            total_clip_fraction += float(clip_fraction.item())
+            total_ratio_mean += float(ratio_mean.item())
+            total_ratio_std += float(ratio_std.item())
+            total_explained_variance += float(explained_variance.item())
             num_updates += 1
 
     return {
@@ -549,6 +591,11 @@ def ppo_update(
         "val_loss": total_val_loss / max(num_updates, 1),
         "bc_loss": total_bc_loss / max(num_updates, 1),
         "entropy": total_entropy / max(num_updates, 1),
+        "approx_kl": total_approx_kl / max(num_updates, 1),
+        "clip_fraction": total_clip_fraction / max(num_updates, 1),
+        "ratio_mean": total_ratio_mean / max(num_updates, 1),
+        "ratio_std": total_ratio_std / max(num_updates, 1),
+        "explained_variance": total_explained_variance / max(num_updates, 1),
     }
 
 
@@ -580,7 +627,29 @@ def train():
     else:
         print("BC reference checkpoint not found, disabling BC regularization during PPO")
 
-    optimizer = optim.Adam(model.parameters(), lr=CFG["lr"], eps=1e-5)
+    optimizer = optim.Adam(
+        [
+            {
+                "params": list(model.actor_core.parameters()),
+                "lr": CFG["actor_core_lr"],
+                "base_lr": CFG["actor_core_lr"],
+                "name": "actor_core",
+            },
+            {
+                "params": list(model.actor_head.parameters()),
+                "lr": CFG["actor_head_lr"],
+                "base_lr": CFG["actor_head_lr"],
+                "name": "actor_head",
+            },
+            {
+                "params": list(model.critic_parameters()),
+                "lr": CFG["critic_lr"],
+                "base_lr": CFG["critic_lr"],
+                "name": "critic",
+            },
+        ],
+        eps=1e-5,
+    )
     global_step = 0
     best_eval_score = float("-inf")
     stage_warmup_until = 0
@@ -778,7 +847,7 @@ def train():
 
         model.train()
         model.set_actor_trainable(actor_trainable)
-        base.sync_linear_lr(optimizer, global_step)
+        sync_group_lrs(optimizer, global_step)
 
         with torch.no_grad():
             _, map_feat_last, aux_feat_last, _action_mask_last = prepare_policy_inputs(
@@ -823,7 +892,9 @@ def train():
             f"NEB {no_escape_bomb_ratio:.2%} | Danger {danger_steps_per_episode:.1f} | "
             f"Tiles {unique_tiles_visited:.1f} | Repeat {repeat_position_rate:.2%} | "
             f"PG {stats['pg_loss']:+.4f} | Val {stats['val_loss']:.4f} | BC {stats['bc_loss']:.4f} | "
-            f"Ent {stats['entropy']:.3f} | SPS {sps:.0f}"
+            f"Ent {stats['entropy']:.3f} | KL {stats['approx_kl']:.4f} | "
+            f"Clip {stats['clip_fraction']:.2%} | Ratio {stats['ratio_mean']:.3f}+/-{stats['ratio_std']:.3f} | "
+            f"EV {stats['explained_variance']:.3f} | SPS {sps:.0f}"
         )
 
         if global_step - last_save_step >= CFG["save_every"]:
