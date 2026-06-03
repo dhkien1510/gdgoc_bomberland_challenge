@@ -82,6 +82,7 @@ def parse_args():
     parser.add_argument("--ckpt_dir", type=str, default=CFG["ckpt_dir"])
     parser.add_argument("--actor_init_path", type=str, default="")
     parser.add_argument("--bc_reference_path", type=str, default=str(_HERE / "bc_actor.pth"))
+    parser.add_argument("--resume_checkpoint", type=str, default="")
     return parser.parse_args()
 
 
@@ -101,6 +102,7 @@ def apply_cli_overrides(args):
     CFG["ckpt_dir"] = str(args.ckpt_dir)
     CFG["actor_init_path"] = str(args.actor_init_path).strip()
     CFG["bc_reference_path"] = str(args.bc_reference_path).strip()
+    CFG["resume_checkpoint"] = str(args.resume_checkpoint).strip()
     if CFG["initial_actor_warmup_steps"] >= CFG["total_steps"]:
         print(
             "Warning: initial_actor_warmup_steps >= total_steps; "
@@ -273,6 +275,14 @@ def resolve_actor_init_path() -> Path | None:
         if path.exists():
             return path
     return None
+
+
+def resolve_resume_checkpoint_path() -> Path | None:
+    explicit = str(CFG.get("resume_checkpoint", "")).strip()
+    if not explicit:
+        return None
+    path = Path(explicit)
+    return path if path.exists() else None
 
 
 def initial_actor_warmup_active(global_step: int, actor_initialized: bool) -> bool:
@@ -547,15 +557,19 @@ def train():
 
     model = RecurrentActorCriticV6().to(DEVICE)
     actor_init_path = resolve_actor_init_path()
+    resume_checkpoint_path = resolve_resume_checkpoint_path()
     actor_initialized = False
     bc_reference_path = Path(str(CFG.get("bc_reference_path", _HERE / "bc_actor.pth")))
     bc_reference_model = None
-    if actor_init_path is not None:
-        result = model.load_actor_from_checkpoint(str(actor_init_path))
-        actor_initialized = bool(result["loaded_actor"])
-        print(f"Actor init from {actor_init_path}: {actor_initialized}")
+    if resume_checkpoint_path is None:
+        if actor_init_path is not None:
+            result = model.load_actor_from_checkpoint(str(actor_init_path))
+            actor_initialized = bool(result["loaded_actor"])
+            print(f"Actor init from {actor_init_path}: {actor_initialized}")
+        else:
+            print("Actor init checkpoint not found, starting PPO actor from scratch")
     else:
-        print("Actor init checkpoint not found, starting PPO actor from scratch")
+        print(f"Resume checkpoint requested: {resume_checkpoint_path}")
     if bc_reference_path.exists():
         checkpoint = _load_checkpoint(bc_reference_path, map_location=DEVICE)
         state_dict = checkpoint.get("model", checkpoint) if isinstance(checkpoint, dict) else checkpoint
@@ -566,9 +580,40 @@ def train():
     else:
         print("BC reference checkpoint not found, disabling BC regularization during PPO")
 
-    stage_warmup_until = 0
-    model.set_actor_trainable(actor_trainable_now(0, actor_initialized, stage_warmup_until))
     optimizer = optim.Adam(model.parameters(), lr=CFG["lr"], eps=1e-5)
+    global_step = 0
+    best_eval_score = float("-inf")
+    stage_warmup_until = 0
+    last_save_step = 0
+    if resume_checkpoint_path is not None:
+        resume_payload = _load_checkpoint(resume_checkpoint_path, map_location=DEVICE)
+        if not isinstance(resume_payload, dict) or "model" not in resume_payload:
+            raise RuntimeError(
+                f"Resume checkpoint {resume_checkpoint_path} does not contain a full PPO checkpoint payload"
+            )
+        model.load_state_dict(resume_payload["model"])
+        optimizer_state = resume_payload.get("optimizer")
+        if optimizer_state is not None:
+            optimizer.load_state_dict(optimizer_state)
+        global_step = int(resume_payload.get("global_step", 0))
+        actor_initialized = bool(resume_payload.get("actor_initialized", True))
+        stage_warmup_until = int(resume_payload.get("stage_warmup_until", 0))
+        best_eval_score = float(
+            resume_payload.get(
+                "best_eval_score",
+                resume_payload.get("eval", {}).get("score", float("-inf")),
+            )
+        )
+        last_save_step = global_step
+        print(
+            f"Resumed PPO from step {global_step:,} | "
+            f"stage {resume_payload.get('stage', base.get_stage(global_step)['name'])} | "
+            f"actor_initialized {actor_initialized}"
+        )
+        if optimizer_state is None:
+            print("Resume checkpoint had no optimizer state; continuing with a fresh optimizer")
+
+    model.set_actor_trainable(actor_trainable_now(global_step, actor_initialized, stage_warmup_until))
     pool = ActiveOpponentPoolV6(
         model_factory=lambda: RecurrentActorCriticV6(),
         recent_size=CFG["pool_size_recent"],
@@ -577,10 +622,7 @@ def train():
     buffer = SequenceRolloutBuffer()
     env = base.BomberEnv(max_steps=500)
 
-    global_step = 0
     episode = 0
-    best_eval_score = float("-inf")
-    last_save_step = 0
     first_history = deque(maxlen=100)
     bombs_per_episode_history = deque(maxlen=100)
     valuable_bomb_ratio_history = deque(maxlen=100)
@@ -795,6 +837,7 @@ def train():
                     "stage": stage["name"],
                     "actor_initialized": actor_initialized,
                     "stage_warmup_until": stage_warmup_until,
+                    "best_eval_score": best_eval_score,
                 },
                 ckpt_path,
             )
@@ -814,10 +857,12 @@ def train():
                 torch.save(
                     {
                         "model": model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
                         "global_step": global_step,
                         "stage": stage["name"],
                         "actor_initialized": actor_initialized,
                         "stage_warmup_until": stage_warmup_until,
+                        "best_eval_score": best_eval_score,
                         "eval": eval_stats,
                     },
                     _HERE / "model.pth",
@@ -827,9 +872,11 @@ def train():
     torch.save(
         {
             "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
             "global_step": global_step,
             "actor_initialized": actor_initialized,
             "stage_warmup_until": stage_warmup_until,
+            "best_eval_score": best_eval_score,
         },
         _HERE / "model_last.pth",
     )
