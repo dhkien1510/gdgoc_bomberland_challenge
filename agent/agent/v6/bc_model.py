@@ -4,11 +4,23 @@ Behavior Cloning recurrent actor components for Bomberland.
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
+
 import numpy as np
 import torch
 import torch.nn as nn
 
-from _model_v3_base import AUX_DIM, NUM_ACTIONS, NUM_CHANNELS, masked_logits
+_HERE = Path(__file__).resolve().parent
+_BASE_SPEC = importlib.util.spec_from_file_location("_v6_model_v3_base_bc", _HERE / "_model_v3_base.py")
+_BASE = importlib.util.module_from_spec(_BASE_SPEC)
+assert _BASE_SPEC.loader is not None
+_BASE_SPEC.loader.exec_module(_BASE)
+
+AUX_DIM = _BASE.AUX_DIM
+NUM_ACTIONS = _BASE.NUM_ACTIONS
+NUM_CHANNELS = _BASE.NUM_CHANNELS
+masked_logits = _BASE.masked_logits
 
 
 class SpatialEncoderV6(nn.Module):

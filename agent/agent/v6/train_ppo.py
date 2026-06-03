@@ -5,6 +5,7 @@ Recurrent PPO fine-tuning for the v6 BC+PPO agent.
 from __future__ import annotations
 
 import copy
+import importlib.util
 import os
 import random
 import sys
@@ -28,7 +29,16 @@ sys.modules.pop("_train_base", None)
 
 import _train_base as base
 from bc_model import CNNLSTMBCActor
-from model import RecurrentActorCriticV6, VALUE_BOMB_MASK_STEPS, prepare_policy_inputs, to_env_action
+
+_MODEL_SPEC = importlib.util.spec_from_file_location("_v6_model_train_ppo", _HERE / "model.py")
+_MODEL = importlib.util.module_from_spec(_MODEL_SPEC)
+assert _MODEL_SPEC.loader is not None
+_MODEL_SPEC.loader.exec_module(_MODEL)
+
+RecurrentActorCriticV6 = _MODEL.RecurrentActorCriticV6
+VALUE_BOMB_MASK_STEPS = _MODEL.VALUE_BOMB_MASK_STEPS
+prepare_policy_inputs = _MODEL.prepare_policy_inputs
+to_env_action = _MODEL.to_env_action
 
 CFG = copy.deepcopy(base.CFG)
 CFG.update(
