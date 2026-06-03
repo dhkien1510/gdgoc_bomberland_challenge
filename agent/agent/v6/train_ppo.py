@@ -165,8 +165,8 @@ class SequenceRolloutBuffer:
                 action_batch[batch_idx, t] = self.actions[src]
                 bc_teacher_action_batch[batch_idx, t] = self.bc_teacher_actions[src]
                 old_log_prob_batch[batch_idx, t] = self.log_probs[src]
-                adv_batch[batch_idx, t] = advantages[src]
-                ret_batch[batch_idx, t] = returns[src]
+                adv_batch[batch_idx, t] = float(advantages[src])
+                ret_batch[batch_idx, t] = float(returns[src])
                 loss_mask[batch_idx, t] = 1.0
                 episode_start_batch[batch_idx, t] = self.episode_starts[src]
 
