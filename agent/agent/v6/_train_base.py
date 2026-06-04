@@ -55,6 +55,7 @@ from simple_rule_agent import SimpleRuleAgent
 from smarter_rule_agent import SmarterRuleAgent
 from tactical_rule_agent import TacticalRuleAgent
 from engine.game import BomberEnv
+from engine.map import Map
 
 _BASE_PATH = _HERE.parent / "v5_1" / "_train_base.py"
 _SPEC = importlib.util.spec_from_file_location("_v5_1_train_base", _BASE_PATH)
@@ -69,6 +70,25 @@ RANK_TO_POINTS = _BASE.RANK_TO_POINTS
 print(f"Using device: {DEVICE}")
 
 CURRICULUM_STAGES = copy.deepcopy(_BASE.CURRICULUM_STAGES)
+RESOURCE_CONTROL_STAGE_START = 1_700_000
+RESOURCE_CONTROL_REWARD = {
+    "r_item_capacity": 0.15,
+    "r_item_radius": 0.12,
+    "r_item_other": 0.05,
+    "r_safe_item_progress_coef": 0.015,
+    "r_safe_item_progress_clip": 0.03,
+    "r_ignore_near_safe_item": -0.015,
+    "near_safe_item_dist": 3,
+    "tiebreak_start_step": 300,
+    "tiebreak_kill_diff_coef": 0.08,
+    "tiebreak_box_diff_coef": 0.03,
+    "tiebreak_item_diff_coef": 0.02,
+    "tiebreak_bomb_diff_coef": 0.005,
+    "tiebreak_delta_clip": 0.03,
+    "resource_adv_bomb_coef": 0.02,
+    "resource_adv_radius_coef": 0.015,
+    "resource_adv_delta_clip": 0.03,
+}
 CURRICULUM_STAGES[1]["end_step"] = 500_000
 CURRICULUM_STAGES[1]["baseline_bots"] = [
     (SimpleRuleAgent, 0.4),
@@ -124,6 +144,44 @@ CURRICULUM_STAGES[3]["reward"].update(
         "r_position_loop": -0.03,
     }
 )
+CURRICULUM_STAGES[3]["end_step"] = RESOURCE_CONTROL_STAGE_START
+CURRICULUM_STAGES.append(
+    {
+        "name": "phase_resource_control",
+        "end_step": None,
+        "baseline_bots": [
+            (TacticalRuleAgent, 0.5),
+            (GeniusRuleAgent, 0.3),
+            (SmarterRuleAgent, 0.2),
+        ],
+        "selfplay_prob": 0.30,
+        "reward": {
+            "step_penalty": -0.01,
+            "r_death": -1.0,
+            "r_kill": 1.6,
+            "r_box_destroy": 0.025,
+            "r_item_collect": 0.08,
+            "r_bomb_place": 0.0,
+            "r_move_closer": 0.0005,
+            "r_move_away": -0.0005,
+            "r_best_enemy_dist": 0.004,
+            "r_danger_critical": -0.22,
+            "r_danger_soon": -0.09,
+            "r_danger_far": -0.02,
+            "r_escape_danger": 0.04,
+            "r_valuable_bomb_enemy": 0.24,
+            "r_valuable_bomb_box": 0.02,
+            "r_useless_bomb": -0.12,
+            "r_no_escape_bomb": -0.60,
+            "rank_rewards": {0: 2.0, 1: 0.45, 2: -0.55, 3: -2.0},
+            "r_move_closer_bomb_spot": 0.001,
+            "r_move_away_bomb_spot": -0.0005,
+            "r_best_bomb_spot_dist": 0.004,
+            "r_position_loop": -0.03,
+            **RESOURCE_CONTROL_REWARD,
+        },
+    }
+)
 
 
 def get_stage(current_step: int):
@@ -131,6 +189,13 @@ def get_stage(current_step: int):
         if stage["end_step"] is None or current_step < stage["end_step"]:
             return stage
     return CURRICULUM_STAGES[-1]
+
+
+def get_stage_by_name(stage_name: str):
+    for stage in CURRICULUM_STAGES:
+        if stage["name"] == stage_name:
+            return stage
+    raise KeyError(f"Unknown curriculum stage: {stage_name}")
 
 
 clone_obs = _BASE.clone_obs
@@ -175,6 +240,91 @@ def is_position_loop(recent_positions: deque[tuple[int, int]]) -> bool:
     return False
 
 
+def alive_agent_ids(obs: dict) -> list[int]:
+    players = np.asarray(obs["players"], dtype=np.int64)
+    return [idx for idx in range(len(players)) if int(players[idx][2]) == 1]
+
+
+def has_clear_kill_opportunity(obs: dict, agent_id: int) -> bool:
+    return has_escape_after_placing_bomb(obs, agent_id) and can_hit_enemy_if_place(obs, agent_id)
+
+
+def nearest_safe_item_dist(obs: dict, agent_id: int) -> int | None:
+    grid = np.asarray(obs["map"], dtype=np.int64)
+    targets = {
+        (row, col)
+        for row in range(1, grid.shape[0] - 1)
+        for col in range(1, grid.shape[1] - 1)
+        if int(grid[row, col]) in (Map.ITEM_RADIUS, Map.ITEM_CAPACITY)
+    }
+    if not targets:
+        return None
+    _first_action, dist = bfs_first_action_to_targets(obs, agent_id, targets, avoid_danger_leq=2)
+    if dist >= 999:
+        return None
+    return int(dist)
+
+
+def infer_picked_item_type(prev_obs: dict, obs: dict, agent_id: int, item_delta: int) -> str | None:
+    if item_delta <= 0:
+        return None
+    players = np.asarray(obs["players"], dtype=np.int64)
+    row = int(players[agent_id][0])
+    col = int(players[agent_id][1])
+    prev_grid = np.asarray(prev_obs["map"], dtype=np.int64)
+    prev_tile = int(prev_grid[row, col])
+    if prev_tile == Map.ITEM_CAPACITY:
+        return "capacity"
+    if prev_tile == Map.ITEM_RADIUS:
+        return "radius"
+    return "other"
+
+
+def _player_competition_tuple(stats: dict) -> tuple[int, int, int, int]:
+    return (
+        int(stats.get("kills", 0)),
+        int(stats.get("boxes", 0)),
+        int(stats.get("items", 0)),
+        int(stats.get("bombs", 0)),
+    )
+
+
+def tie_break_advantage(stats_list: list[dict] | None, agent_id: int, reward_cfg: dict) -> float | None:
+    if not stats_list or agent_id >= len(stats_list):
+        return None
+    enemy_tuples = [
+        _player_competition_tuple(stats)
+        for idx, stats in enumerate(stats_list)
+        if idx != agent_id
+    ]
+    if not enemy_tuples:
+        return None
+    my_tuple = _player_competition_tuple(stats_list[agent_id])
+    best_enemy_tuple = max(enemy_tuples)
+    return (
+        reward_cfg["tiebreak_kill_diff_coef"] * (my_tuple[0] - best_enemy_tuple[0])
+        + reward_cfg["tiebreak_box_diff_coef"] * (my_tuple[1] - best_enemy_tuple[1])
+        + reward_cfg["tiebreak_item_diff_coef"] * (my_tuple[2] - best_enemy_tuple[2])
+        + reward_cfg["tiebreak_bomb_diff_coef"] * (my_tuple[3] - best_enemy_tuple[3])
+    )
+
+
+def resource_advantage(obs: dict, agent_id: int, reward_cfg: dict) -> float | None:
+    players = np.asarray(obs["players"], dtype=np.int64)
+    alive_ids = alive_agent_ids(obs)
+    if len(alive_ids) != 2 or agent_id not in alive_ids:
+        return None
+    enemy_id = alive_ids[0] if alive_ids[1] == agent_id else alive_ids[1]
+    my_bombs_left = int(players[agent_id][3])
+    enemy_bombs_left = int(players[enemy_id][3])
+    my_radius = 1 + int(players[agent_id][4])
+    enemy_radius = 1 + int(players[enemy_id][4])
+    return (
+        reward_cfg["resource_adv_bomb_coef"] * (my_bombs_left - enemy_bombs_left)
+        + reward_cfg["resource_adv_radius_coef"] * (my_radius - enemy_radius)
+    )
+
+
 def make_episode_context(obs: dict, agent_id: int) -> dict:
     start_row = int(obs["players"][agent_id][0])
     start_col = int(obs["players"][agent_id][1])
@@ -212,6 +362,9 @@ def compute_reward(
     episode_ctx,
     stage,
     canonical_action: int | None = None,
+    all_prev_stats: list[dict] | None = None,
+    all_curr_stats: list[dict] | None = None,
+    current_step: int | None = None,
 ):
     reward_cfg = stage["reward"]
     reward = reward_cfg["step_penalty"]
@@ -304,6 +457,67 @@ def compute_reward(
     if curr_danger is None and is_position_loop(episode_ctx["recent_positions"]):
         reward += reward_cfg["r_position_loop"]
 
+    if stage["name"] == "phase_resource_control":
+        item_delta = curr_stats["items"] - prev_stats["items"]
+        picked_item_type = infer_picked_item_type(prev_obs, obs, agent_id, item_delta)
+        if picked_item_type == "capacity":
+            reward += reward_cfg["r_item_capacity"]
+        elif picked_item_type == "radius":
+            reward += reward_cfg["r_item_radius"]
+        elif picked_item_type is not None:
+            reward += reward_cfg["r_item_other"]
+
+        in_immediate_danger = prev_danger is not None and prev_danger <= 2
+        kill_opportunity = has_clear_kill_opportunity(prev_obs, agent_id)
+        if not in_immediate_danger and not kill_opportunity:
+            prev_item_dist = nearest_safe_item_dist(prev_obs, agent_id)
+            curr_item_dist = nearest_safe_item_dist(obs, agent_id)
+            if prev_item_dist is not None and curr_item_dist is not None:
+                item_progress = prev_item_dist - curr_item_dist
+                reward += float(
+                    np.clip(
+                        reward_cfg["r_safe_item_progress_coef"] * item_progress,
+                        -reward_cfg["r_safe_item_progress_clip"],
+                        reward_cfg["r_safe_item_progress_clip"],
+                    )
+                )
+            if (
+                item_delta <= 0
+                and prev_item_dist is not None
+                and prev_item_dist <= reward_cfg["near_safe_item_dist"]
+                and curr_item_dist is not None
+                and curr_item_dist > prev_item_dist
+            ):
+                reward += reward_cfg["r_ignore_near_safe_item"]
+
+        alive_count = len(alive_agent_ids(obs))
+        if (
+            (current_step is not None and current_step >= reward_cfg["tiebreak_start_step"])
+            or alive_count <= 2
+        ):
+            prev_tb_score = tie_break_advantage(all_prev_stats, agent_id, reward_cfg)
+            curr_tb_score = tie_break_advantage(all_curr_stats, agent_id, reward_cfg)
+            if prev_tb_score is not None and curr_tb_score is not None:
+                reward += float(
+                    np.clip(
+                        curr_tb_score - prev_tb_score,
+                        -reward_cfg["tiebreak_delta_clip"],
+                        reward_cfg["tiebreak_delta_clip"],
+                    )
+                )
+
+        if alive_count == 2:
+            prev_resource_adv = resource_advantage(prev_obs, agent_id, reward_cfg)
+            curr_resource_adv = resource_advantage(obs, agent_id, reward_cfg)
+            if prev_resource_adv is not None and curr_resource_adv is not None:
+                reward += float(
+                    np.clip(
+                        curr_resource_adv - prev_resource_adv,
+                        -reward_cfg["resource_adv_delta_clip"],
+                        reward_cfg["resource_adv_delta_clip"],
+                    )
+                )
+
     if done and rank is not None:
         reward += reward_cfg["rank_rewards"].get(rank, 0.0)
 
@@ -336,6 +550,7 @@ __all__ = [
     "ModelOpponent",
     "RANK_TO_POINTS",
     "RandomAgent",
+    "RESOURCE_CONTROL_STAGE_START",
     "RolloutBuffer",
     "SimpleRuleAgent",
     "SmarterRuleAgent",
@@ -348,9 +563,13 @@ __all__ = [
     "count_boxes_if_place",
     "danger_time",
     "get_stage",
+    "get_stage_by_name",
     "has_attack_pressure",
+    "has_clear_kill_opportunity",
     "has_escape_after_placing_bomb",
+    "infer_picked_item_type",
     "mask_eval_mode",
+    "nearest_safe_item_dist",
     "nearest_enemy_distance",
     "nearest_valuable_bomb_spot_info",
     "ppo_update",

@@ -92,6 +92,7 @@ def parse_args():
     parser.add_argument("--bc_reference_path", type=str, default=str(_HERE / "bc_actor.pth"))
     parser.add_argument("--resume_checkpoint", type=str, default="")
     parser.add_argument("--resume_global_step_override", type=int, default=-1)
+    parser.add_argument("--force_stage", type=str, default="")
     parser.add_argument("--eval_only", type=int, default=0)
     return parser.parse_args()
 
@@ -118,6 +119,7 @@ def apply_cli_overrides(args):
     CFG["bc_reference_path"] = str(args.bc_reference_path).strip()
     CFG["resume_checkpoint"] = str(args.resume_checkpoint).strip()
     CFG["resume_global_step_override"] = int(args.resume_global_step_override)
+    CFG["force_stage"] = str(args.force_stage).strip()
     CFG["eval_only"] = bool(int(args.eval_only))
     if CFG["initial_actor_warmup_steps"] >= CFG["total_steps"]:
         print(
@@ -130,6 +132,15 @@ def apply_cli_overrides(args):
         raise ValueError("num_envs must be >= 1")
     if CFG["n_steps"] % CFG["num_envs"] != 0:
         raise ValueError("n_steps must be divisible by num_envs for vectorized rollout")
+    if CFG["force_stage"]:
+        base.get_stage_by_name(CFG["force_stage"])
+
+
+def get_training_stage(current_step: int):
+    forced_stage = str(CFG.get("force_stage", "")).strip()
+    if forced_stage:
+        return base.get_stage_by_name(forced_stage)
+    return base.get_stage(current_step)
 
 
 def _load_checkpoint(path: str | Path, map_location):
@@ -304,6 +315,25 @@ class ActiveOpponentPoolV6(base.ActiveOpponentPool):
         model.eval()
         return ModelOpponentV6(model, agent_id, current_step)
 
+    def get_opponent(self, agent_id: int, current_step: int = 0):
+        stage = get_training_stage(current_step)
+        selfplay_prob = stage["selfplay_prob"]
+        can_selfplay = bool(self.recent_checkpoints or self.best_checkpoints)
+
+        if can_selfplay and random.random() < selfplay_prob:
+            source_items = []
+            if self.best_checkpoints:
+                source_items.append(("best", 0.4))
+            if self.recent_checkpoints:
+                source_items.append(("recent", 0.6))
+            source = base.weighted_choice(source_items)
+            if source == "best":
+                return self._load_checkpoint_opponent(random.choice(list(self.best_checkpoints)), agent_id, current_step)
+            return self._load_checkpoint_opponent(random.choice(list(self.recent_checkpoints)), agent_id, current_step)
+
+        cls = base.weighted_choice(stage["baseline_bots"])
+        return cls(agent_id)
+
 
 class ModelOpponentV6:
     def __init__(self, model, agent_id, current_step: int):
@@ -389,7 +419,7 @@ def model_action(model, obs, agent_id: int, deterministic: bool, current_step: i
     return env_action, int(action), next_state
 
 
-def run_eval_match(model, opponent_classes, seed: int, agent_id: int, current_step: int):
+def run_eval_match(model, opponent_classes, seed: int, agent_id: int, current_step: int, stage_override=None):
     def _player_competition_tuple(player):
         stats = player.stats
         return (
@@ -422,6 +452,7 @@ def run_eval_match(model, opponent_classes, seed: int, agent_id: int, current_st
         }
         actor_state = model.get_initial_actor_state(1, DEVICE)
         episode_start = True
+        reward_stage = stage_override or get_training_stage(current_step)
 
         alive_mask = [bool(player.alive) for player in env.players]
         death_order = []
@@ -450,10 +481,12 @@ def run_eval_match(model, opponent_classes, seed: int, agent_id: int, current_st
 
             prev_obs = base.clone_obs(obs)
             prev_stats = base.clone_stats(env.players[agent_id])
+            prev_all_stats = [base.clone_stats(player) for player in env.players]
             obs, terminated, truncated = env.step(actions)
             done = terminated or truncated
             base.record_deaths(env.players, alive_mask, death_order)
             curr_stats = base.clone_stats(env.players[agent_id])
+            curr_all_stats = [base.clone_stats(player) for player in env.players]
             base.compute_reward(
                 prev_obs,
                 obs,
@@ -463,8 +496,11 @@ def run_eval_match(model, opponent_classes, seed: int, agent_id: int, current_st
                 done,
                 None,
                 episode_ctx,
-                base.get_stage(current_step),
+                reward_stage,
                 canonical_action=canonical_action,
+                all_prev_stats=prev_all_stats,
+                all_curr_stats=curr_all_stats,
+                current_step=env.current_step,
             )
 
         ranks = base.compute_competition_ranks(env.players, death_order, alive_mask)
@@ -542,7 +578,15 @@ def run_eval_match(model, opponent_classes, seed: int, agent_id: int, current_st
         }
 
 
-def evaluate_suite(model, opponent_classes, num_matches: int, seed_offset: int, seed_base: int, current_step: int):
+def evaluate_suite(
+    model,
+    opponent_classes,
+    num_matches: int,
+    seed_offset: int,
+    seed_base: int,
+    current_step: int,
+    stage_override=None,
+):
     suite_rng = random.Random(seed_base + seed_offset)
     rank_counts = [0, 0, 0, 0]
     totals = {
@@ -588,7 +632,14 @@ def evaluate_suite(model, opponent_classes, num_matches: int, seed_offset: int, 
     for match_idx in range(num_matches):
         seed = seed_base + seed_offset + match_idx
         agent_id = suite_rng.randrange(4)
-        result = run_eval_match(model, opponent_classes, seed=seed, agent_id=agent_id, current_step=current_step)
+        result = run_eval_match(
+            model,
+            opponent_classes,
+            seed=seed,
+            agent_id=agent_id,
+            current_step=current_step,
+            stage_override=stage_override,
+        )
         if 0 <= int(result["rank"]) < len(rank_counts):
             rank_counts[int(result["rank"])] += 1
         for key in totals:
@@ -644,6 +695,7 @@ def evaluate_suite(model, opponent_classes, num_matches: int, seed_offset: int, 
 
 
 def evaluate_policy(model, current_step: int):
+    reward_stage = get_training_stage(current_step)
     easy_medium = evaluate_suite(
         model,
         opponent_classes=[base.SimpleRuleAgent, base.SmarterRuleAgent, base.BoxFarmerAgent],
@@ -651,6 +703,7 @@ def evaluate_policy(model, current_step: int):
         seed_offset=0,
         seed_base=CFG["eval_seed_base"],
         current_step=current_step,
+        stage_override=reward_stage,
     )
     hard = evaluate_suite(
         model,
@@ -659,6 +712,7 @@ def evaluate_policy(model, current_step: int):
         seed_offset=10_000,
         seed_base=CFG["eval_seed_base"],
         current_step=current_step,
+        stage_override=reward_stage,
     )
     total_matches = easy_medium["matches"] + hard["matches"]
     total_points = easy_medium["total_points"] + hard["total_points"]
@@ -922,16 +976,19 @@ def train():
             )
         )
         last_save_step = global_step
+        effective_stage_name = get_training_stage(global_step)["name"]
         print(
             f"Resumed PPO from step {global_step:,} | "
-            f"stage {resume_payload.get('stage', base.get_stage(global_step)['name'])} | "
+            f"stage {resume_payload.get('stage', effective_stage_name)} | "
             f"actor_initialized {actor_initialized}"
         )
         if CFG.get("resume_global_step_override", -1) >= 0:
             print(
                 f"Resume global_step override applied: {CFG['resume_global_step_override']:,} | "
-                f"effective stage {base.get_stage(global_step)['name']}"
+                f"effective stage {effective_stage_name}"
             )
+        if CFG.get("force_stage", ""):
+            print(f"Force stage active: {CFG['force_stage']} | effective stage {effective_stage_name}")
         if optimizer_state is None:
             print("Resume checkpoint had no optimizer state; continuing with a fresh optimizer")
         elif not optimizer_loaded:
@@ -977,7 +1034,7 @@ def train():
     actor_h, actor_c = model.get_initial_actor_state(num_envs, DEVICE)
     bc_reference_state = None if bc_reference_model is None else bc_reference_model.get_initial_state(num_envs, DEVICE)
     actor_trainable = actor_trainable_now(global_step, actor_initialized, stage_warmup_until)
-    active_stage_name = base.get_stage(global_step)["name"]
+    active_stage_name = get_training_stage(global_step)["name"]
     t_start = time.time()
 
     if CFG.get("eval_only", False):
@@ -1036,10 +1093,10 @@ def train():
     while global_step < CFG["total_steps"]:
         buffer.reset()
         model.eval()
-        stage = base.get_stage(global_step)
+        stage = get_training_stage(global_step)
 
         for _ in range(rollout_env_steps):
-            stage = base.get_stage(global_step)
+            stage = get_training_stage(global_step)
             if stage["name"] != active_stage_name:
                 prev_stage_name = active_stage_name
                 active_stage_name = stage["name"]
@@ -1116,6 +1173,7 @@ def train():
 
                 prev_obs = base.clone_obs(env_obs[env_idx])
                 prev_stats = base.clone_stats(envs[env_idx].players[agent_id])
+                prev_all_stats = [base.clone_stats(player) for player in envs[env_idx].players]
                 env_obs[env_idx], terminated, truncated = envs[env_idx].step(actions)
                 done = terminated or truncated
                 base.record_deaths(envs[env_idx].players, env_alive_masks[env_idx], env_death_orders[env_idx])
@@ -1130,6 +1188,7 @@ def train():
                     agent_rank = ranks[agent_id]
 
                 curr_stats = base.clone_stats(envs[env_idx].players[agent_id])
+                curr_all_stats = [base.clone_stats(player) for player in envs[env_idx].players]
                 reward = base.compute_reward(
                     prev_obs,
                     env_obs[env_idx],
@@ -1141,6 +1200,9 @@ def train():
                     env_episode_ctxs[env_idx],
                     stage,
                     canonical_action=canonical_action,
+                    all_prev_stats=prev_all_stats,
+                    all_curr_stats=curr_all_stats,
+                    current_step=envs[env_idx].current_step,
                 )
 
                 buffer.push(
