@@ -89,6 +89,7 @@ def parse_args():
     parser.add_argument("--actor_init_path", type=str, default="")
     parser.add_argument("--bc_reference_path", type=str, default=str(_HERE / "bc_actor.pth"))
     parser.add_argument("--resume_checkpoint", type=str, default="")
+    parser.add_argument("--eval_only", type=int, default=0)
     return parser.parse_args()
 
 
@@ -112,6 +113,7 @@ def apply_cli_overrides(args):
     CFG["actor_init_path"] = str(args.actor_init_path).strip()
     CFG["bc_reference_path"] = str(args.bc_reference_path).strip()
     CFG["resume_checkpoint"] = str(args.resume_checkpoint).strip()
+    CFG["eval_only"] = bool(int(args.eval_only))
     if CFG["initial_actor_warmup_steps"] >= CFG["total_steps"]:
         print(
             "Warning: initial_actor_warmup_steps >= total_steps; "
@@ -757,6 +759,29 @@ def train():
     actor_trainable = actor_trainable_now(global_step, actor_initialized, stage_warmup_until)
     active_stage_name = base.get_stage(global_step)["name"]
     t_start = time.time()
+
+    if CFG.get("eval_only", False):
+        model.eval()
+        eval_stats = evaluate_policy(model, current_step=global_step)
+        print(
+            f"Eval only | score {eval_stats['score']:.3f} | AvgRank {eval_stats['avg_rank']:.2f} | "
+            f"R0/1/2/3 {eval_stats['rank0_rate']:.0%}/{eval_stats['rank1_rate']:.0%}/"
+            f"{eval_stats['rank2_rate']:.0%}/{eval_stats['rank3_rate']:.0%} | "
+            f"UF {eval_stats['unique_first_rate']:.0%}"
+        )
+        print(
+            f"  EM score/rank {eval_stats['easy_medium']['avg_points']:.3f}/{eval_stats['easy_medium']['avg_rank']:.2f} | "
+            f"R0/1/2/3 {eval_stats['easy_medium']['rank0_rate']:.0%}/{eval_stats['easy_medium']['rank1_rate']:.0%}/"
+            f"{eval_stats['easy_medium']['rank2_rate']:.0%}/{eval_stats['easy_medium']['rank3_rate']:.0%} | "
+            f"VB/Repeat {eval_stats['easy_medium']['valuable_bomb_ratio']:.2%}/{eval_stats['easy_medium']['repeat_position_rate']:.2%}"
+        )
+        print(
+            f"  Hard score/rank {eval_stats['hard']['avg_points']:.3f}/{eval_stats['hard']['avg_rank']:.2f} | "
+            f"R0/1/2/3 {eval_stats['hard']['rank0_rate']:.0%}/{eval_stats['hard']['rank1_rate']:.0%}/"
+            f"{eval_stats['hard']['rank2_rate']:.0%}/{eval_stats['hard']['rank3_rate']:.0%} | "
+            f"VB/Repeat {eval_stats['hard']['valuable_bomb_ratio']:.2%}/{eval_stats['hard']['repeat_position_rate']:.2%}"
+        )
+        return
 
     print(f"\n{'=' * 60}")
     print("Training Recurrent PPO Agent V6 - BC Initialized")
