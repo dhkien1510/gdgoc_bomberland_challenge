@@ -390,6 +390,26 @@ def model_action(model, obs, agent_id: int, deterministic: bool, current_step: i
 
 
 def run_eval_match(model, opponent_classes, seed: int, agent_id: int, current_step: int):
+    def _player_competition_tuple(player):
+        stats = player.stats
+        return (
+            int(stats["kills"]),
+            int(stats["boxes"]),
+            int(stats["items"]),
+            int(stats["bombs"]),
+        )
+
+    def _tie_break_loss_reason(our_player, best_enemy_player):
+        our_tuple = _player_competition_tuple(our_player)
+        enemy_tuple = _player_competition_tuple(best_enemy_player)
+        labels = ("kills", "boxes", "items", "bombs")
+        for idx, label in enumerate(labels):
+            if enemy_tuple[idx] > our_tuple[idx]:
+                return label
+            if enemy_tuple[idx] < our_tuple[idx]:
+                return "won"
+        return "identical"
+
     with base.temporary_random_seed(seed):
         env = base.BomberEnv(max_steps=500, seed=seed)
         obs = env.reset(seed=seed)
@@ -450,6 +470,34 @@ def run_eval_match(model, opponent_classes, seed: int, agent_id: int, current_st
         ranks = base.compute_competition_ranks(env.players, death_order, alive_mask)
         rank = ranks[agent_id]
         first_group_size = sum(1 for r in ranks if r == 0)
+        our_player = env.players[agent_id]
+        better_enemy_ids = [pid for pid in range(4) if pid != agent_id and ranks[pid] < rank]
+        if better_enemy_ids:
+            best_enemy_id = min(
+                better_enemy_ids,
+                key=lambda pid: (
+                    ranks[pid],
+                    -env.players[pid].stats["kills"],
+                    -env.players[pid].stats["boxes"],
+                    -env.players[pid].stats["items"],
+                    -env.players[pid].stats["bombs"],
+                ),
+            )
+        else:
+            best_enemy_id = max(
+                (pid for pid in range(4) if pid != agent_id),
+                key=lambda pid: (
+                    env.players[pid].stats["kills"],
+                    env.players[pid].stats["boxes"],
+                    env.players[pid].stats["items"],
+                    env.players[pid].stats["bombs"],
+                ),
+            )
+        best_enemy = env.players[best_enemy_id]
+        timeout = bool(truncated and env.current_step >= env.max_steps)
+        timeout_win = bool(timeout and rank == 0)
+        timeout_loss = bool(timeout and rank != 0)
+        timeout_loss_reason = _tie_break_loss_reason(our_player, best_enemy) if timeout_loss else "none"
         final_stats = base.clone_stats(env.players[agent_id])
         episode_metrics = base.summarize_episode_metrics(episode_ctx, final_stats)
         return {
@@ -465,6 +513,32 @@ def run_eval_match(model, opponent_classes, seed: int, agent_id: int, current_st
             "valuable_bomb_ratio": episode_metrics["valuable_bomb_ratio"],
             "repeat_position_rate": episode_metrics["repeat_position_rate"],
             "danger_steps": episode_metrics["danger_steps_per_episode"],
+            "our_bombs": float(our_player.stats["bombs"]),
+            "our_kills": float(our_player.stats["kills"]),
+            "our_boxes": float(our_player.stats["boxes"]),
+            "our_items": float(our_player.stats["items"]),
+            "best_enemy_bombs": float(best_enemy.stats["bombs"]),
+            "best_enemy_kills": float(best_enemy.stats["kills"]),
+            "best_enemy_boxes": float(best_enemy.stats["boxes"]),
+            "best_enemy_items": float(best_enemy.stats["items"]),
+            "bomb_diff_vs_best_enemy": float(our_player.stats["bombs"] - best_enemy.stats["bombs"]),
+            "kill_diff_vs_best_enemy": float(our_player.stats["kills"] - best_enemy.stats["kills"]),
+            "box_diff_vs_best_enemy": float(our_player.stats["boxes"] - best_enemy.stats["boxes"]),
+            "item_diff_vs_best_enemy": float(our_player.stats["items"] - best_enemy.stats["items"]),
+            "our_final_capacity": float(our_player.bombs_left),
+            "our_final_radius": float(1 + our_player.bomb_radius_bonus),
+            "best_enemy_final_capacity": float(best_enemy.bombs_left),
+            "best_enemy_final_radius": float(1 + best_enemy.bomb_radius_bonus),
+            "capacity_diff_vs_best_enemy": float(our_player.bombs_left - best_enemy.bombs_left),
+            "radius_diff_vs_best_enemy": float((1 + our_player.bomb_radius_bonus) - (1 + best_enemy.bomb_radius_bonus)),
+            "timeout": float(timeout),
+            "timeout_win": float(timeout_win),
+            "timeout_loss": float(timeout_loss),
+            "timeout_loss_by_kills": float(timeout_loss_reason == "kills"),
+            "timeout_loss_by_boxes": float(timeout_loss_reason == "boxes"),
+            "timeout_loss_by_items": float(timeout_loss_reason == "items"),
+            "timeout_loss_by_bombs": float(timeout_loss_reason == "bombs"),
+            "timeout_loss_identical": float(timeout_loss_reason == "identical"),
         }
 
 
@@ -484,6 +558,32 @@ def evaluate_suite(model, opponent_classes, num_matches: int, seed_offset: int, 
         "valuable_bomb_ratio": 0.0,
         "repeat_position_rate": 0.0,
         "danger_steps": 0.0,
+        "our_bombs": 0.0,
+        "our_kills": 0.0,
+        "our_boxes": 0.0,
+        "our_items": 0.0,
+        "best_enemy_bombs": 0.0,
+        "best_enemy_kills": 0.0,
+        "best_enemy_boxes": 0.0,
+        "best_enemy_items": 0.0,
+        "bomb_diff_vs_best_enemy": 0.0,
+        "kill_diff_vs_best_enemy": 0.0,
+        "box_diff_vs_best_enemy": 0.0,
+        "item_diff_vs_best_enemy": 0.0,
+        "our_final_capacity": 0.0,
+        "our_final_radius": 0.0,
+        "best_enemy_final_capacity": 0.0,
+        "best_enemy_final_radius": 0.0,
+        "capacity_diff_vs_best_enemy": 0.0,
+        "radius_diff_vs_best_enemy": 0.0,
+        "timeout": 0.0,
+        "timeout_win": 0.0,
+        "timeout_loss": 0.0,
+        "timeout_loss_by_kills": 0.0,
+        "timeout_loss_by_boxes": 0.0,
+        "timeout_loss_by_items": 0.0,
+        "timeout_loss_by_bombs": 0.0,
+        "timeout_loss_identical": 0.0,
     }
     for match_idx in range(num_matches):
         seed = seed_base + seed_offset + match_idx
@@ -514,6 +614,32 @@ def evaluate_suite(model, opponent_classes, num_matches: int, seed_offset: int, 
         "rank1_rate": rank_counts[1] / denom,
         "rank2_rate": rank_counts[2] / denom,
         "rank3_rate": rank_counts[3] / denom,
+        "avg_our_bombs": totals["our_bombs"] / denom,
+        "avg_our_kills": totals["our_kills"] / denom,
+        "avg_our_boxes": totals["our_boxes"] / denom,
+        "avg_our_items": totals["our_items"] / denom,
+        "avg_best_enemy_bombs": totals["best_enemy_bombs"] / denom,
+        "avg_best_enemy_kills": totals["best_enemy_kills"] / denom,
+        "avg_best_enemy_boxes": totals["best_enemy_boxes"] / denom,
+        "avg_best_enemy_items": totals["best_enemy_items"] / denom,
+        "avg_bomb_diff_vs_best_enemy": totals["bomb_diff_vs_best_enemy"] / denom,
+        "avg_kill_diff_vs_best_enemy": totals["kill_diff_vs_best_enemy"] / denom,
+        "avg_box_diff_vs_best_enemy": totals["box_diff_vs_best_enemy"] / denom,
+        "avg_item_diff_vs_best_enemy": totals["item_diff_vs_best_enemy"] / denom,
+        "avg_our_final_capacity": totals["our_final_capacity"] / denom,
+        "avg_our_final_radius": totals["our_final_radius"] / denom,
+        "avg_best_enemy_final_capacity": totals["best_enemy_final_capacity"] / denom,
+        "avg_best_enemy_final_radius": totals["best_enemy_final_radius"] / denom,
+        "avg_capacity_diff_vs_best_enemy": totals["capacity_diff_vs_best_enemy"] / denom,
+        "avg_radius_diff_vs_best_enemy": totals["radius_diff_vs_best_enemy"] / denom,
+        "timeout_rate": totals["timeout"] / denom,
+        "timeout_win_rate": totals["timeout_win"] / denom,
+        "timeout_loss_rate": totals["timeout_loss"] / denom,
+        "timeout_loss_by_kills": totals["timeout_loss_by_kills"] / denom,
+        "timeout_loss_by_boxes": totals["timeout_loss_by_boxes"] / denom,
+        "timeout_loss_by_items": totals["timeout_loss_by_items"] / denom,
+        "timeout_loss_by_bombs": totals["timeout_loss_by_bombs"] / denom,
+        "timeout_loss_identical": totals["timeout_loss_identical"] / denom,
     }
 
 
@@ -550,6 +676,39 @@ def evaluate_policy(model, current_step: int):
     total_rank1 = easy_medium["rank1_rate"] * easy_medium["matches"] + hard["rank1_rate"] * hard["matches"]
     total_rank2 = easy_medium["rank2_rate"] * easy_medium["matches"] + hard["rank2_rate"] * hard["matches"]
     total_rank3 = easy_medium["rank3_rate"] * easy_medium["matches"] + hard["rank3_rate"] * hard["matches"]
+    aggregate_keys = [
+        "avg_our_bombs",
+        "avg_our_kills",
+        "avg_our_boxes",
+        "avg_our_items",
+        "avg_best_enemy_bombs",
+        "avg_best_enemy_kills",
+        "avg_best_enemy_boxes",
+        "avg_best_enemy_items",
+        "avg_bomb_diff_vs_best_enemy",
+        "avg_kill_diff_vs_best_enemy",
+        "avg_box_diff_vs_best_enemy",
+        "avg_item_diff_vs_best_enemy",
+        "avg_our_final_capacity",
+        "avg_our_final_radius",
+        "avg_best_enemy_final_capacity",
+        "avg_best_enemy_final_radius",
+        "avg_capacity_diff_vs_best_enemy",
+        "avg_radius_diff_vs_best_enemy",
+        "timeout_rate",
+        "timeout_win_rate",
+        "timeout_loss_rate",
+        "timeout_loss_by_kills",
+        "timeout_loss_by_boxes",
+        "timeout_loss_by_items",
+        "timeout_loss_by_bombs",
+        "timeout_loss_identical",
+    ]
+    aggregate = {}
+    for key in aggregate_keys:
+        aggregate[key] = (
+            easy_medium[key] * easy_medium["matches"] + hard[key] * hard["matches"]
+        ) / max(total_matches, 1)
     return {
         "score": total_points / max(total_matches, 1),
         "avg_rank": total_rank / max(total_matches, 1),
@@ -560,6 +719,7 @@ def evaluate_policy(model, current_step: int):
         "rank1_rate": total_rank1 / max(total_matches, 1),
         "rank2_rate": total_rank2 / max(total_matches, 1),
         "rank3_rate": total_rank3 / max(total_matches, 1),
+        **aggregate,
         "easy_medium": easy_medium,
         "hard": hard,
     }
@@ -841,6 +1001,28 @@ def train():
             f"{eval_stats['hard']['rank2_rate']:.0%}/{eval_stats['hard']['rank3_rate']:.0%} | "
             f"VB/Repeat {eval_stats['hard']['valuable_bomb_ratio']:.2%}/{eval_stats['hard']['repeat_position_rate']:.2%}"
         )
+        print(
+            f"  Our K/B/I/Bp {eval_stats['avg_our_kills']:.2f}/{eval_stats['avg_our_boxes']:.2f}/"
+            f"{eval_stats['avg_our_items']:.2f}/{eval_stats['avg_our_bombs']:.2f} | "
+            f"BestEnemy K/B/I/Bp {eval_stats['avg_best_enemy_kills']:.2f}/{eval_stats['avg_best_enemy_boxes']:.2f}/"
+            f"{eval_stats['avg_best_enemy_items']:.2f}/{eval_stats['avg_best_enemy_bombs']:.2f}"
+        )
+        print(
+            f"  Diff K/B/I/Bp {eval_stats['avg_kill_diff_vs_best_enemy']:+.2f}/"
+            f"{eval_stats['avg_box_diff_vs_best_enemy']:+.2f}/"
+            f"{eval_stats['avg_item_diff_vs_best_enemy']:+.2f}/"
+            f"{eval_stats['avg_bomb_diff_vs_best_enemy']:+.2f} | "
+            f"Cap/Radius diff {eval_stats['avg_capacity_diff_vs_best_enemy']:+.2f}/"
+            f"{eval_stats['avg_radius_diff_vs_best_enemy']:+.2f}"
+        )
+        print(
+            f"  Timeout {eval_stats['timeout_rate']:.2%} | win {eval_stats['timeout_win_rate']:.2%} | "
+            f"loss {eval_stats['timeout_loss_rate']:.2%} | "
+            f"loss_by K/B/I/B {eval_stats['timeout_loss_by_kills']:.2%}/"
+            f"{eval_stats['timeout_loss_by_boxes']:.2%}/"
+            f"{eval_stats['timeout_loss_by_items']:.2%}/"
+            f"{eval_stats['timeout_loss_by_bombs']:.2%}"
+        )
         return
 
     print(f"\n{'=' * 60}")
@@ -1110,6 +1292,18 @@ def train():
                 f"R0/1/2/3 {eval_stats['hard']['rank0_rate']:.0%}/{eval_stats['hard']['rank1_rate']:.0%}/"
                 f"{eval_stats['hard']['rank2_rate']:.0%}/{eval_stats['hard']['rank3_rate']:.0%} | "
                 f"VB/Repeat {eval_stats['hard']['valuable_bomb_ratio']:.2%}/{eval_stats['hard']['repeat_position_rate']:.2%}"
+            )
+            print(
+                f"     Diff K/B/I/Bp {eval_stats['avg_kill_diff_vs_best_enemy']:+.2f}/"
+                f"{eval_stats['avg_box_diff_vs_best_enemy']:+.2f}/"
+                f"{eval_stats['avg_item_diff_vs_best_enemy']:+.2f}/"
+                f"{eval_stats['avg_bomb_diff_vs_best_enemy']:+.2f} | "
+                f"Cap/Radius {eval_stats['avg_capacity_diff_vs_best_enemy']:+.2f}/"
+                f"{eval_stats['avg_radius_diff_vs_best_enemy']:+.2f} | "
+                f"Timeout loss K/B/I/B {eval_stats['timeout_loss_by_kills']:.2%}/"
+                f"{eval_stats['timeout_loss_by_boxes']:.2%}/"
+                f"{eval_stats['timeout_loss_by_items']:.2%}/"
+                f"{eval_stats['timeout_loss_by_bombs']:.2%}"
             )
 
             if eval_stats["score"] >= best_eval_score:
