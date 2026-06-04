@@ -440,6 +440,7 @@ def run_eval_match(model, opponent_classes, seed: int, agent_id: int, current_st
 
 def evaluate_suite(model, opponent_classes, num_matches: int, seed_offset: int, seed_base: int, current_step: int):
     suite_rng = random.Random(seed_base + seed_offset)
+    rank_counts = [0, 0, 0, 0]
     totals = {
         "points": 0.0,
         "first": 0.0,
@@ -458,6 +459,8 @@ def evaluate_suite(model, opponent_classes, num_matches: int, seed_offset: int, 
         seed = seed_base + seed_offset + match_idx
         agent_id = suite_rng.randrange(4)
         result = run_eval_match(model, opponent_classes, seed=seed, agent_id=agent_id, current_step=current_step)
+        if 0 <= int(result["rank"]) < len(rank_counts):
+            rank_counts[int(result["rank"])] += 1
         for key in totals:
             if key in result:
                 totals[key] += result[key]
@@ -477,6 +480,10 @@ def evaluate_suite(model, opponent_classes, num_matches: int, seed_offset: int, 
         "repeat_position_rate": totals["repeat_position_rate"] / denom,
         "danger_steps": totals["danger_steps"] / denom,
         "total_points": totals["points"],
+        "rank0_rate": rank_counts[0] / denom,
+        "rank1_rate": rank_counts[1] / denom,
+        "rank2_rate": rank_counts[2] / denom,
+        "rank3_rate": rank_counts[3] / denom,
     }
 
 
@@ -499,8 +506,30 @@ def evaluate_policy(model, current_step: int):
     )
     total_matches = easy_medium["matches"] + hard["matches"]
     total_points = easy_medium["total_points"] + hard["total_points"]
+    total_first = easy_medium["first_rate"] * easy_medium["matches"] + hard["first_rate"] * hard["matches"]
+    total_unique_first = (
+        easy_medium["unique_first_rate"] * easy_medium["matches"]
+        + hard["unique_first_rate"] * hard["matches"]
+    )
+    total_shared_first = (
+        easy_medium["shared_first_rate"] * easy_medium["matches"]
+        + hard["shared_first_rate"] * hard["matches"]
+    )
+    total_rank = easy_medium["avg_rank"] * easy_medium["matches"] + hard["avg_rank"] * hard["matches"]
+    total_rank0 = easy_medium["rank0_rate"] * easy_medium["matches"] + hard["rank0_rate"] * hard["matches"]
+    total_rank1 = easy_medium["rank1_rate"] * easy_medium["matches"] + hard["rank1_rate"] * hard["matches"]
+    total_rank2 = easy_medium["rank2_rate"] * easy_medium["matches"] + hard["rank2_rate"] * hard["matches"]
+    total_rank3 = easy_medium["rank3_rate"] * easy_medium["matches"] + hard["rank3_rate"] * hard["matches"]
     return {
         "score": total_points / max(total_matches, 1),
+        "avg_rank": total_rank / max(total_matches, 1),
+        "first_rate": total_first / max(total_matches, 1),
+        "unique_first_rate": total_unique_first / max(total_matches, 1),
+        "shared_first_rate": total_shared_first / max(total_matches, 1),
+        "rank0_rate": total_rank0 / max(total_matches, 1),
+        "rank1_rate": total_rank1 / max(total_matches, 1),
+        "rank2_rate": total_rank2 / max(total_matches, 1),
+        "rank3_rate": total_rank3 / max(total_matches, 1),
         "easy_medium": easy_medium,
         "hard": hard,
     }
@@ -937,9 +966,22 @@ def train():
             pool.add_recent_checkpoint(model.state_dict())
             eval_stats = evaluate_policy(model, current_step=global_step)
             print(
-                f"  -> Eval score {eval_stats['score']:.3f} | "
-                f"EM VB/Repeat {eval_stats['easy_medium']['valuable_bomb_ratio']:.2%}/{eval_stats['easy_medium']['repeat_position_rate']:.2%} | "
-                f"Hard VB/Repeat {eval_stats['hard']['valuable_bomb_ratio']:.2%}/{eval_stats['hard']['repeat_position_rate']:.2%}"
+                f"  -> Eval score {eval_stats['score']:.3f} | AvgRank {eval_stats['avg_rank']:.2f} | "
+                f"R0/1/2/3 {eval_stats['rank0_rate']:.0%}/{eval_stats['rank1_rate']:.0%}/"
+                f"{eval_stats['rank2_rate']:.0%}/{eval_stats['rank3_rate']:.0%} | "
+                f"UF {eval_stats['unique_first_rate']:.0%}"
+            )
+            print(
+                f"     EM score/rank {eval_stats['easy_medium']['avg_points']:.3f}/{eval_stats['easy_medium']['avg_rank']:.2f} | "
+                f"R0/1/2/3 {eval_stats['easy_medium']['rank0_rate']:.0%}/{eval_stats['easy_medium']['rank1_rate']:.0%}/"
+                f"{eval_stats['easy_medium']['rank2_rate']:.0%}/{eval_stats['easy_medium']['rank3_rate']:.0%} | "
+                f"VB/Repeat {eval_stats['easy_medium']['valuable_bomb_ratio']:.2%}/{eval_stats['easy_medium']['repeat_position_rate']:.2%}"
+            )
+            print(
+                f"     Hard score/rank {eval_stats['hard']['avg_points']:.3f}/{eval_stats['hard']['avg_rank']:.2f} | "
+                f"R0/1/2/3 {eval_stats['hard']['rank0_rate']:.0%}/{eval_stats['hard']['rank1_rate']:.0%}/"
+                f"{eval_stats['hard']['rank2_rate']:.0%}/{eval_stats['hard']['rank3_rate']:.0%} | "
+                f"VB/Repeat {eval_stats['hard']['valuable_bomb_ratio']:.2%}/{eval_stats['hard']['repeat_position_rate']:.2%}"
             )
 
             if eval_stats["score"] >= best_eval_score:
