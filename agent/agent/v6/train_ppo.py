@@ -46,6 +46,7 @@ CFG.update(
     {
         "entropy_coef": 0.001,
         "n_steps": 1024,
+        "num_envs": 1,
         "seq_len": 64,
         "batch_size_sequences": 16,
         "ppo_epochs": 4,
@@ -73,6 +74,7 @@ def parse_args():
     parser.add_argument("--total_steps", type=int, default=CFG["total_steps"])
     parser.add_argument("--save_every", type=int, default=CFG["save_every"])
     parser.add_argument("--n_steps", type=int, default=CFG["n_steps"])
+    parser.add_argument("--num_envs", type=int, default=CFG["num_envs"])
     parser.add_argument("--seq_len", type=int, default=CFG["seq_len"])
     parser.add_argument("--batch_size_sequences", type=int, default=CFG["batch_size_sequences"])
     parser.add_argument("--ppo_epochs", type=int, default=CFG["ppo_epochs"])
@@ -89,6 +91,7 @@ def parse_args():
     parser.add_argument("--actor_init_path", type=str, default="")
     parser.add_argument("--bc_reference_path", type=str, default=str(_HERE / "bc_actor.pth"))
     parser.add_argument("--resume_checkpoint", type=str, default="")
+    parser.add_argument("--resume_global_step_override", type=int, default=-1)
     parser.add_argument("--eval_only", type=int, default=0)
     return parser.parse_args()
 
@@ -97,6 +100,7 @@ def apply_cli_overrides(args):
     CFG["total_steps"] = int(args.total_steps)
     CFG["save_every"] = int(args.save_every)
     CFG["n_steps"] = int(args.n_steps)
+    CFG["num_envs"] = int(args.num_envs)
     CFG["seq_len"] = int(args.seq_len)
     CFG["batch_size_sequences"] = int(args.batch_size_sequences)
     CFG["ppo_epochs"] = int(args.ppo_epochs)
@@ -113,6 +117,7 @@ def apply_cli_overrides(args):
     CFG["actor_init_path"] = str(args.actor_init_path).strip()
     CFG["bc_reference_path"] = str(args.bc_reference_path).strip()
     CFG["resume_checkpoint"] = str(args.resume_checkpoint).strip()
+    CFG["resume_global_step_override"] = int(args.resume_global_step_override)
     CFG["eval_only"] = bool(int(args.eval_only))
     if CFG["initial_actor_warmup_steps"] >= CFG["total_steps"]:
         print(
@@ -121,6 +126,10 @@ def apply_cli_overrides(args):
         )
     if CFG["save_every"] > CFG["total_steps"]:
         print("Warning: save_every > total_steps; only the final model may be saved.")
+    if CFG["num_envs"] <= 0:
+        raise ValueError("num_envs must be >= 1")
+    if CFG["n_steps"] % CFG["num_envs"] != 0:
+        raise ValueError("n_steps must be divisible by num_envs for vectorized rollout")
 
 
 def _load_checkpoint(path: str | Path, map_location):
@@ -154,25 +163,27 @@ def sync_group_lrs(optimizer: optim.Optimizer, global_step: int):
 
 
 class SequenceRolloutBuffer:
-    def __init__(self):
+    def __init__(self, num_envs: int):
+        self.num_envs = int(num_envs)
         self.reset()
 
     def reset(self):
-        self.map_feats = []
-        self.aux_feats = []
-        self.action_masks = []
-        self.actor_h = []
-        self.actor_c = []
-        self.actions = []
-        self.bc_teacher_actions = []
-        self.log_probs = []
-        self.rewards = []
-        self.values = []
-        self.dones = []
-        self.episode_starts = []
+        self.map_feats = [[] for _ in range(self.num_envs)]
+        self.aux_feats = [[] for _ in range(self.num_envs)]
+        self.action_masks = [[] for _ in range(self.num_envs)]
+        self.actor_h = [[] for _ in range(self.num_envs)]
+        self.actor_c = [[] for _ in range(self.num_envs)]
+        self.actions = [[] for _ in range(self.num_envs)]
+        self.bc_teacher_actions = [[] for _ in range(self.num_envs)]
+        self.log_probs = [[] for _ in range(self.num_envs)]
+        self.rewards = [[] for _ in range(self.num_envs)]
+        self.values = [[] for _ in range(self.num_envs)]
+        self.dones = [[] for _ in range(self.num_envs)]
+        self.episode_starts = [[] for _ in range(self.num_envs)]
 
     def push(
         self,
+        env_idx,
         map_feat,
         aux_feat,
         action_mask,
@@ -185,41 +196,58 @@ class SequenceRolloutBuffer:
         done,
         episode_start,
     ):
-        self.map_feats.append(map_feat.clone())
-        self.aux_feats.append(aux_feat.clone())
-        self.action_masks.append(action_mask.clone())
-        self.actor_h.append(actor_state[0].detach().cpu().squeeze(0).clone())
-        self.actor_c.append(actor_state[1].detach().cpu().squeeze(0).clone())
-        self.actions.append(int(action))
-        self.bc_teacher_actions.append(int(bc_teacher_action))
-        self.log_probs.append(float(log_prob))
-        self.rewards.append(float(reward))
-        self.values.append(float(value))
-        self.dones.append(float(done))
-        self.episode_starts.append(float(episode_start))
+        env_idx = int(env_idx)
+        self.map_feats[env_idx].append(map_feat.clone())
+        self.aux_feats[env_idx].append(aux_feat.clone())
+        self.action_masks[env_idx].append(action_mask.clone())
+        self.actor_h[env_idx].append(actor_state[0].detach().cpu().clone())
+        self.actor_c[env_idx].append(actor_state[1].detach().cpu().clone())
+        self.actions[env_idx].append(int(action))
+        self.bc_teacher_actions[env_idx].append(int(bc_teacher_action))
+        self.log_probs[env_idx].append(float(log_prob))
+        self.rewards[env_idx].append(float(reward))
+        self.values[env_idx].append(float(value))
+        self.dones[env_idx].append(float(done))
+        self.episode_starts[env_idx].append(float(episode_start))
 
-    def compute_gae(self, last_value, gamma, gae_lambda):
-        advantages = np.zeros(len(self.rewards), dtype=np.float32)
-        last_gae = 0.0
-        next_value = float(last_value)
-        for t in reversed(range(len(self.rewards))):
-            nonterminal = 1.0 - self.dones[t]
-            delta = self.rewards[t] + gamma * next_value * nonterminal - self.values[t]
-            last_gae = delta + gamma * gae_lambda * nonterminal * last_gae
-            advantages[t] = last_gae
-            next_value = self.values[t]
-        returns = advantages + np.asarray(self.values, dtype=np.float32)
+    def compute_gae(self, last_values, gamma, gae_lambda):
+        advantages = []
+        returns = []
+        for env_idx in range(self.num_envs):
+            env_rewards = self.rewards[env_idx]
+            env_values = self.values[env_idx]
+            env_dones = self.dones[env_idx]
+            env_advantages = np.zeros(len(env_rewards), dtype=np.float32)
+            last_gae = 0.0
+            next_value = float(last_values[env_idx])
+            for t in reversed(range(len(env_rewards))):
+                nonterminal = 1.0 - env_dones[t]
+                delta = env_rewards[t] + gamma * next_value * nonterminal - env_values[t]
+                last_gae = delta + gamma * gae_lambda * nonterminal * last_gae
+                env_advantages[t] = last_gae
+                next_value = env_values[t]
+            env_returns = env_advantages + np.asarray(env_values, dtype=np.float32)
+            advantages.append(env_advantages)
+            returns.append(env_returns)
         return advantages, returns
 
     def make_windows(self, seq_len: int):
-        return [(start, min(start + seq_len, len(self.actions))) for start in range(0, len(self.actions), seq_len)]
+        windows = []
+        for env_idx in range(self.num_envs):
+            env_len = len(self.actions[env_idx])
+            for start in range(0, env_len, seq_len):
+                windows.append((env_idx, start, min(start + seq_len, env_len)))
+        return windows
 
     def build_sequence_batch(self, windows, advantages, returns, device):
         batch_size = len(windows)
-        seq_len = max(end - start for start, end in windows)
-        map_shape = self.map_feats[0].shape
-        aux_dim = self.aux_feats[0].shape[0]
-        action_dim = self.action_masks[0].shape[0]
+        seq_len = max(end - start for _env_idx, start, end in windows)
+        sample_env_idx = next((idx for idx in range(self.num_envs) if self.map_feats[idx]), None)
+        if sample_env_idx is None:
+            raise RuntimeError("Cannot build a sequence batch from an empty rollout buffer")
+        map_shape = self.map_feats[sample_env_idx][0].shape
+        aux_dim = self.aux_feats[sample_env_idx][0].shape[0]
+        action_dim = self.action_masks[sample_env_idx][0].shape[0]
 
         map_batch = torch.zeros((batch_size, seq_len, *map_shape), dtype=torch.float32, device=device)
         aux_batch = torch.zeros((batch_size, seq_len, aux_dim), dtype=torch.float32, device=device)
@@ -231,26 +259,26 @@ class SequenceRolloutBuffer:
         ret_batch = torch.zeros((batch_size, seq_len), dtype=torch.float32, device=device)
         loss_mask = torch.zeros((batch_size, seq_len), dtype=torch.float32, device=device)
         episode_start_batch = torch.zeros((batch_size, seq_len), dtype=torch.float32, device=device)
-        hidden_size = self.actor_h[0].shape[0]
+        hidden_size = self.actor_h[sample_env_idx][0].shape[0]
         init_h_batch = torch.zeros((batch_size, hidden_size), dtype=torch.float32, device=device)
         init_c_batch = torch.zeros((batch_size, hidden_size), dtype=torch.float32, device=device)
 
-        for batch_idx, (start, end) in enumerate(windows):
+        for batch_idx, (env_idx, start, end) in enumerate(windows):
             length = end - start
-            init_h_batch[batch_idx] = self.actor_h[start]
-            init_c_batch[batch_idx] = self.actor_c[start]
+            init_h_batch[batch_idx] = self.actor_h[env_idx][start]
+            init_c_batch[batch_idx] = self.actor_c[env_idx][start]
             for t in range(length):
                 src = start + t
-                map_batch[batch_idx, t] = self.map_feats[src]
-                aux_batch[batch_idx, t] = self.aux_feats[src]
-                mask_batch[batch_idx, t] = self.action_masks[src]
-                action_batch[batch_idx, t] = self.actions[src]
-                bc_teacher_action_batch[batch_idx, t] = self.bc_teacher_actions[src]
-                old_log_prob_batch[batch_idx, t] = self.log_probs[src]
-                adv_batch[batch_idx, t] = float(advantages[src])
-                ret_batch[batch_idx, t] = float(returns[src])
+                map_batch[batch_idx, t] = self.map_feats[env_idx][src]
+                aux_batch[batch_idx, t] = self.aux_feats[env_idx][src]
+                mask_batch[batch_idx, t] = self.action_masks[env_idx][src]
+                action_batch[batch_idx, t] = self.actions[env_idx][src]
+                bc_teacher_action_batch[batch_idx, t] = self.bc_teacher_actions[env_idx][src]
+                old_log_prob_batch[batch_idx, t] = self.log_probs[env_idx][src]
+                adv_batch[batch_idx, t] = float(advantages[env_idx][src])
+                ret_batch[batch_idx, t] = float(returns[env_idx][src])
                 loss_mask[batch_idx, t] = 1.0
-                episode_start_batch[batch_idx, t] = self.episode_starts[src]
+                episode_start_batch[batch_idx, t] = self.episode_starts[env_idx][src]
 
         return {
             "map_feats": map_batch,
@@ -541,12 +569,20 @@ def ppo_update(
     model,
     optimizer,
     buffer: SequenceRolloutBuffer,
-    last_value: float,
+    last_values,
     actor_trainable: bool,
     bc_coef: float,
 ):
-    advantages, returns = buffer.compute_gae(last_value, CFG["gamma"], CFG["gae_lambda"])
-    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    advantages, returns = buffer.compute_gae(last_values, CFG["gamma"], CFG["gae_lambda"])
+    flat_advantages = np.concatenate([env_adv for env_adv in advantages if len(env_adv) > 0], axis=0)
+    flat_advantages = (flat_advantages - flat_advantages.mean()) / (flat_advantages.std() + 1e-8)
+    offset = 0
+    norm_advantages = []
+    for env_adv in advantages:
+        env_len = len(env_adv)
+        norm_advantages.append(flat_advantages[offset:offset + env_len].copy())
+        offset += env_len
+    advantages = norm_advantages
     windows = buffer.make_windows(CFG["seq_len"])
 
     total_pg_loss = 0.0
@@ -648,6 +684,8 @@ def ppo_update(
 
 def train():
     os.makedirs(CFG["ckpt_dir"], exist_ok=True)
+    num_envs = CFG["num_envs"]
+    rollout_env_steps = CFG["n_steps"] // num_envs
 
     model = RecurrentActorCriticV6().to(DEVICE)
     actor_init_path = resolve_actor_init_path()
@@ -711,8 +749,12 @@ def train():
         optimizer_state = resume_payload.get("optimizer")
         optimizer_loaded = _try_load_optimizer_state(optimizer, optimizer_state)
         global_step = int(resume_payload.get("global_step", 0))
+        if CFG.get("resume_global_step_override", -1) >= 0:
+            global_step = int(CFG["resume_global_step_override"])
         actor_initialized = bool(resume_payload.get("actor_initialized", True))
         stage_warmup_until = int(resume_payload.get("stage_warmup_until", 0))
+        if CFG.get("resume_global_step_override", -1) >= 0:
+            stage_warmup_until = 0
         best_eval_score = float(
             resume_payload.get(
                 "best_eval_score",
@@ -725,6 +767,11 @@ def train():
             f"stage {resume_payload.get('stage', base.get_stage(global_step)['name'])} | "
             f"actor_initialized {actor_initialized}"
         )
+        if CFG.get("resume_global_step_override", -1) >= 0:
+            print(
+                f"Resume global_step override applied: {CFG['resume_global_step_override']:,} | "
+                f"effective stage {base.get_stage(global_step)['name']}"
+            )
         if optimizer_state is None:
             print("Resume checkpoint had no optimizer state; continuing with a fresh optimizer")
         elif not optimizer_loaded:
@@ -739,8 +786,8 @@ def train():
         recent_size=CFG["pool_size_recent"],
         best_size=CFG["pool_size_best"],
     )
-    buffer = SequenceRolloutBuffer()
-    env = base.BomberEnv(max_steps=500)
+    buffer = SequenceRolloutBuffer(num_envs=num_envs)
+    envs = [base.BomberEnv(max_steps=500) for _ in range(num_envs)]
 
     episode = 0
     first_history = deque(maxlen=100)
@@ -752,10 +799,23 @@ def train():
     unique_tiles_history = deque(maxlen=100)
     repeat_position_rate_history = deque(maxlen=100)
 
-    obs, agent_id, opponents, alive_mask, death_order, episode_ctx = base.start_episode(env, pool, global_step)
-    actor_state = model.get_initial_actor_state(1, DEVICE)
-    bc_reference_state = None if bc_reference_model is None else bc_reference_model.get_initial_state(1, DEVICE)
-    episode_start = True
+    env_obs = []
+    env_agent_ids = []
+    env_opponents = []
+    env_alive_masks = []
+    env_death_orders = []
+    env_episode_ctxs = []
+    env_episode_starts = [True for _ in range(num_envs)]
+    for env in envs:
+        obs, agent_id, opponents, alive_mask, death_order, episode_ctx = base.start_episode(env, pool, global_step)
+        env_obs.append(obs)
+        env_agent_ids.append(agent_id)
+        env_opponents.append(opponents)
+        env_alive_masks.append(alive_mask)
+        env_death_orders.append(death_order)
+        env_episode_ctxs.append(episode_ctx)
+    actor_h, actor_c = model.get_initial_actor_state(num_envs, DEVICE)
+    bc_reference_state = None if bc_reference_model is None else bc_reference_model.get_initial_state(num_envs, DEVICE)
     actor_trainable = actor_trainable_now(global_step, actor_initialized, stage_warmup_until)
     active_stage_name = base.get_stage(global_step)["name"]
     t_start = time.time()
@@ -796,8 +856,7 @@ def train():
         model.eval()
         stage = base.get_stage(global_step)
 
-        for _ in range(CFG["n_steps"]):
-            global_step += 1
+        for _ in range(rollout_env_steps):
             stage = base.get_stage(global_step)
             if stage["name"] != active_stage_name:
                 prev_stage_name = active_stage_name
@@ -814,27 +873,36 @@ def train():
                 model.set_actor_trainable(actor_trainable)
                 print(f"Actor trainable switched to {actor_trainable} at step {global_step:,}")
 
-            _, map_feat, aux_feat, action_mask = prepare_policy_inputs(
-                obs,
-                agent_id,
-                current_step=global_step,
-                warmup_steps=CFG["mask_warmup_steps"],
-                value_bomb_mask_steps=VALUE_BOMB_MASK_STEPS,
-                eval_mode=False,
-            )
-            map_feat_batch = map_feat.unsqueeze(0).to(DEVICE)
-            aux_feat_batch = aux_feat.unsqueeze(0).to(DEVICE)
-            action_mask_batch = action_mask.unsqueeze(0).to(DEVICE)
+            step_current = global_step + 1
+            map_feats_cpu = []
+            aux_feats_cpu = []
+            action_masks_cpu = []
+            for env_idx in range(num_envs):
+                _canonical_obs, map_feat, aux_feat, action_mask = prepare_policy_inputs(
+                    env_obs[env_idx],
+                    env_agent_ids[env_idx],
+                    current_step=step_current,
+                    warmup_steps=CFG["mask_warmup_steps"],
+                    value_bomb_mask_steps=VALUE_BOMB_MASK_STEPS,
+                    eval_mode=False,
+                )
+                map_feats_cpu.append(map_feat)
+                aux_feats_cpu.append(aux_feat)
+                action_masks_cpu.append(action_mask)
+            map_feat_batch = torch.stack(map_feats_cpu, dim=0).to(DEVICE)
+            aux_feat_batch = torch.stack(aux_feats_cpu, dim=0).to(DEVICE)
+            action_mask_batch = torch.stack(action_masks_cpu, dim=0).to(DEVICE)
+            episode_start_tensor = torch.tensor(env_episode_starts, device=DEVICE, dtype=torch.float32)
 
             with torch.no_grad():
-                rollout_actor_state = actor_state
+                rollout_actor_state = (actor_h.clone(), actor_c.clone())
                 action, log_prob, value, next_actor_state = model.act_step(
                     map_feat_batch,
                     aux_feat_batch,
                     action_mask=action_mask_batch,
-                    state=actor_state,
+                    state=(actor_h, actor_c),
                     deterministic=False,
-                    episode_start=torch.tensor([float(episode_start)], device=DEVICE),
+                    episode_start=episode_start_tensor,
                 )
                 if bc_reference_model is not None:
                     bc_teacher_action, bc_reference_state = bc_reference_model.act_step(
@@ -843,107 +911,142 @@ def train():
                         action_mask=action_mask_batch,
                         state=bc_reference_state,
                         deterministic=True,
-                        episode_start=torch.tensor([float(episode_start)], device=DEVICE),
+                        episode_start=episode_start_tensor,
                     )
-                    bc_teacher_action = int(bc_teacher_action.item())
-                else:
-                    bc_teacher_action = int(action.item())
+                if bc_reference_model is None:
+                    bc_teacher_action = action.clone()
 
-            canonical_action = int(action.item())
-            env_action = to_env_action(canonical_action, agent_id)
-            actions = [0] * 4
-            actions[agent_id] = env_action
-            for opponent_id, opponent in opponents.items():
-                try:
-                    actions[opponent_id] = int(opponent.act(obs))
-                except Exception:
-                    actions[opponent_id] = 0
+            next_actor_h, next_actor_c = next_actor_state
+            next_bc_h = None if bc_reference_state is None else bc_reference_state[0]
+            next_bc_c = None if bc_reference_state is None else bc_reference_state[1]
 
-            prev_obs = base.clone_obs(obs)
-            prev_stats = base.clone_stats(env.players[agent_id])
-            obs, terminated, truncated = env.step(actions)
-            done = terminated or truncated
-            base.record_deaths(env.players, alive_mask, death_order)
+            for env_idx in range(num_envs):
+                canonical_action = int(action[env_idx].item())
+                agent_id = env_agent_ids[env_idx]
+                env_action = to_env_action(canonical_action, agent_id)
+                actions = [0] * 4
+                actions[agent_id] = env_action
+                for opponent_id, opponent in env_opponents[env_idx].items():
+                    try:
+                        actions[opponent_id] = int(opponent.act(env_obs[env_idx]))
+                    except Exception:
+                        actions[opponent_id] = 0
 
-            agent_rank = None
-            if done:
-                ranks = base.compute_competition_ranks(env.players, death_order, alive_mask)
-                agent_rank = ranks[agent_id]
+                prev_obs = base.clone_obs(env_obs[env_idx])
+                prev_stats = base.clone_stats(envs[env_idx].players[agent_id])
+                env_obs[env_idx], terminated, truncated = envs[env_idx].step(actions)
+                done = terminated or truncated
+                base.record_deaths(envs[env_idx].players, env_alive_masks[env_idx], env_death_orders[env_idx])
 
-            curr_stats = base.clone_stats(env.players[agent_id])
-            reward = base.compute_reward(
-                prev_obs,
-                obs,
-                prev_stats,
-                curr_stats,
-                agent_id,
-                done,
-                agent_rank,
-                episode_ctx,
-                stage,
-                canonical_action=canonical_action,
-            )
+                agent_rank = None
+                if done:
+                    ranks = base.compute_competition_ranks(
+                        envs[env_idx].players,
+                        env_death_orders[env_idx],
+                        env_alive_masks[env_idx],
+                    )
+                    agent_rank = ranks[agent_id]
 
-            buffer.push(
-                map_feat.cpu(),
-                aux_feat.cpu(),
-                action_mask.cpu(),
-                rollout_actor_state,
-                canonical_action,
-                bc_teacher_action,
-                float(log_prob.item()),
-                reward,
-                float(value.item()),
-                float(done),
-                float(episode_start),
-            )
+                curr_stats = base.clone_stats(envs[env_idx].players[agent_id])
+                reward = base.compute_reward(
+                    prev_obs,
+                    env_obs[env_idx],
+                    prev_stats,
+                    curr_stats,
+                    agent_id,
+                    done,
+                    agent_rank,
+                    env_episode_ctxs[env_idx],
+                    stage,
+                    canonical_action=canonical_action,
+                )
 
-            actor_state = next_actor_state
-            episode_start = False
+                buffer.push(
+                    env_idx,
+                    map_feats_cpu[env_idx],
+                    aux_feats_cpu[env_idx],
+                    action_masks_cpu[env_idx],
+                    (
+                        rollout_actor_state[0][env_idx].detach().cpu().clone(),
+                        rollout_actor_state[1][env_idx].detach().cpu().clone(),
+                    ),
+                    canonical_action,
+                    int(bc_teacher_action[env_idx].item()),
+                    float(log_prob[env_idx].item()),
+                    reward,
+                    float(value[env_idx].item()),
+                    float(done),
+                    float(env_episode_starts[env_idx]),
+                )
 
-            if done:
-                episode += 1
-                first_history.append(1.0 if agent_rank == 0 else 0.0)
-                episode_metrics = base.summarize_episode_metrics(episode_ctx, curr_stats)
-                bombs_per_episode_history.append(episode_metrics["bombs_per_episode"])
-                valuable_bomb_ratio_history.append(episode_metrics["valuable_bomb_ratio"])
-                useless_bomb_ratio_history.append(episode_metrics["useless_bomb_ratio"])
-                no_escape_bomb_ratio_history.append(episode_metrics["no_escape_bomb_ratio"])
-                danger_steps_history.append(episode_metrics["danger_steps_per_episode"])
-                unique_tiles_history.append(episode_metrics["unique_tiles_visited"])
-                repeat_position_rate_history.append(episode_metrics["repeat_position_rate"])
+                env_episode_starts[env_idx] = False
 
-                obs, agent_id, opponents, alive_mask, death_order, episode_ctx = base.start_episode(env, pool, global_step)
-                actor_state = model.get_initial_actor_state(1, DEVICE)
-                if bc_reference_model is not None:
-                    bc_reference_state = bc_reference_model.get_initial_state(1, DEVICE)
-                episode_start = True
+                if done:
+                    episode += 1
+                    first_history.append(1.0 if agent_rank == 0 else 0.0)
+                    episode_metrics = base.summarize_episode_metrics(env_episode_ctxs[env_idx], curr_stats)
+                    bombs_per_episode_history.append(episode_metrics["bombs_per_episode"])
+                    valuable_bomb_ratio_history.append(episode_metrics["valuable_bomb_ratio"])
+                    useless_bomb_ratio_history.append(episode_metrics["useless_bomb_ratio"])
+                    no_escape_bomb_ratio_history.append(episode_metrics["no_escape_bomb_ratio"])
+                    danger_steps_history.append(episode_metrics["danger_steps_per_episode"])
+                    unique_tiles_history.append(episode_metrics["unique_tiles_visited"])
+                    repeat_position_rate_history.append(episode_metrics["repeat_position_rate"])
+
+                    (
+                        env_obs[env_idx],
+                        env_agent_ids[env_idx],
+                        env_opponents[env_idx],
+                        env_alive_masks[env_idx],
+                        env_death_orders[env_idx],
+                        env_episode_ctxs[env_idx],
+                    ) = base.start_episode(envs[env_idx], pool, global_step)
+                    next_actor_h[env_idx].zero_()
+                    next_actor_c[env_idx].zero_()
+                    if next_bc_h is not None and next_bc_c is not None:
+                        next_bc_h[env_idx].zero_()
+                        next_bc_c[env_idx].zero_()
+                    env_episode_starts[env_idx] = True
+
+            actor_h, actor_c = next_actor_h, next_actor_c
+            if next_bc_h is not None and next_bc_c is not None:
+                bc_reference_state = (next_bc_h, next_bc_c)
+            global_step += num_envs
 
         model.train()
         model.set_actor_trainable(actor_trainable)
         sync_group_lrs(optimizer, global_step)
 
         with torch.no_grad():
-            _, map_feat_last, aux_feat_last, _action_mask_last = prepare_policy_inputs(
-                obs,
-                agent_id,
-                current_step=global_step,
-                warmup_steps=CFG["mask_warmup_steps"],
-                value_bomb_mask_steps=VALUE_BOMB_MASK_STEPS,
-                eval_mode=False,
-            )
-            last_value = float(
+            last_map_feats = []
+            last_aux_feats = []
+            for env_idx in range(num_envs):
+                _, map_feat_last, aux_feat_last, _action_mask_last = prepare_policy_inputs(
+                    env_obs[env_idx],
+                    env_agent_ids[env_idx],
+                    current_step=global_step,
+                    warmup_steps=CFG["mask_warmup_steps"],
+                    value_bomb_mask_steps=VALUE_BOMB_MASK_STEPS,
+                    eval_mode=False,
+                )
+                last_map_feats.append(map_feat_last)
+                last_aux_feats.append(aux_feat_last)
+            last_values = (
                 model.forward_value_step(
-                    map_feat_last.unsqueeze(0).to(DEVICE),
-                    aux_feat_last.unsqueeze(0).to(DEVICE),
-                ).item()
+                    torch.stack(last_map_feats, dim=0).to(DEVICE),
+                    torch.stack(last_aux_feats, dim=0).to(DEVICE),
+                )
+                .squeeze(-1)
+                .detach()
+                .cpu()
+                .numpy()
             )
 
         stats = ppo_update(
             model,
             optimizer,
             buffer,
-            last_value,
+            last_values,
             actor_trainable=actor_trainable,
             bc_coef=CFG["bc_coef"] if bc_reference_model is not None else 0.0,
         )
