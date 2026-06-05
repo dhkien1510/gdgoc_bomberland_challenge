@@ -81,7 +81,7 @@ OPPONENT_CLASS_REGISTRY = {
 _EVAL_WORKER_MODEL = None
 _EVAL_WORKER_DEVICE = None
 _EVAL_WORKER_CURRENT_STEP = 0
-_EVAL_WORKER_STAGE_NAME = ""
+_EVAL_WORKER_STAGE_OVERRIDE = None
 _EVAL_WORKER_OPPONENT_CLASSES = None
 
 
@@ -657,15 +657,15 @@ def run_eval_match(model, opponent_classes, seed: int, agent_id: int, current_st
     )
 
 
-def _eval_worker_init(model_state_dict, current_step: int, stage_name: str, opponent_class_names):
-    global _EVAL_WORKER_MODEL, _EVAL_WORKER_DEVICE, _EVAL_WORKER_CURRENT_STEP, _EVAL_WORKER_STAGE_NAME, _EVAL_WORKER_OPPONENT_CLASSES
+def _eval_worker_init(model_state_dict, current_step: int, stage_override, opponent_class_names):
+    global _EVAL_WORKER_MODEL, _EVAL_WORKER_DEVICE, _EVAL_WORKER_CURRENT_STEP, _EVAL_WORKER_STAGE_OVERRIDE, _EVAL_WORKER_OPPONENT_CLASSES
     _EVAL_WORKER_DEVICE = torch.device("cpu")
     _EVAL_WORKER_MODEL = RecurrentActorCriticV6()
     _EVAL_WORKER_MODEL.load_state_dict(model_state_dict)
     _EVAL_WORKER_MODEL.to(_EVAL_WORKER_DEVICE)
     _EVAL_WORKER_MODEL.eval()
     _EVAL_WORKER_CURRENT_STEP = int(current_step)
-    _EVAL_WORKER_STAGE_NAME = str(stage_name)
+    _EVAL_WORKER_STAGE_OVERRIDE = copy.deepcopy(stage_override)
     _EVAL_WORKER_OPPONENT_CLASSES = [OPPONENT_CLASS_REGISTRY[name] for name in opponent_class_names]
 
 
@@ -678,7 +678,7 @@ def _eval_worker_run(task):
         seed=int(seed),
         agent_id=int(agent_id),
         current_step=_EVAL_WORKER_CURRENT_STEP,
-        stage_override=resolve_stage_by_name(_EVAL_WORKER_STAGE_NAME),
+        stage_override=_EVAL_WORKER_STAGE_OVERRIDE,
     )
 
 
@@ -801,16 +801,14 @@ def evaluate_suite(
             for key, value in model.state_dict().items()
         }
         opponent_class_names = [cls.__name__ for cls in opponent_classes]
-        stage_name = (
-            stage_override["name"]
-            if isinstance(stage_override, dict)
-            else get_training_stage(current_step)["name"]
+        stage_payload = copy.deepcopy(
+            stage_override if isinstance(stage_override, dict) else get_training_stage(current_step)
         )
         ctx = mp.get_context("spawn")
         with ctx.Pool(
             processes=eval_workers,
             initializer=_eval_worker_init,
-            initargs=(model_state_cpu, current_step, stage_name, opponent_class_names),
+            initargs=(model_state_cpu, current_step, stage_payload, opponent_class_names),
         ) as pool:
             results = pool.map(_eval_worker_run, tasks)
     else:
