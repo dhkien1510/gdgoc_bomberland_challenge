@@ -72,8 +72,8 @@ print(f"Using device: {DEVICE}")
 CURRICULUM_STAGES = copy.deepcopy(_BASE.CURRICULUM_STAGES)
 RESOURCE_CONTROL_STAGE_START = 1_700_000
 RESOURCE_CONTROL_REWARD = {
-    "r_item_capacity": 0.15,
-    "r_item_radius": 0.12,
+    "r_item_capacity": 0.20,
+    "r_item_radius": 0.22,
     "r_item_other": 0.05,
     "r_safe_item_progress_coef": 0.015,
     "r_safe_item_progress_clip": 0.03,
@@ -82,8 +82,8 @@ RESOURCE_CONTROL_REWARD = {
     "tiebreak_start_step": 300,
     "tiebreak_kill_diff_coef": 0.08,
     "tiebreak_box_diff_coef": 0.03,
-    "tiebreak_item_diff_coef": 0.02,
-    "tiebreak_bomb_diff_coef": 0.005,
+    "tiebreak_item_diff_coef": 0.04,
+    "tiebreak_bomb_diff_coef": 0.0,
     "tiebreak_delta_clip": 0.03,
     "resource_adv_bomb_coef": 0.02,
     "resource_adv_radius_coef": 0.015,
