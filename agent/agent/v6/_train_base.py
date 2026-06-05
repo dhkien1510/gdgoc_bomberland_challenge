@@ -24,24 +24,31 @@ ROOT = _HERE.parent.parent.parent
 BASELINE_DIR = ROOT / "agent"
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
+sys.modules.pop("_model_base", None)
+sys.modules.pop("_model_v3_base", None)
 
-from _model_v3_base import (
-    MASK_WARMUP_STEPS,
-    CNNActorCriticV3,
-    VALUE_BOMB_MASK_STEPS,
-    bfs_first_action_to_targets,
-    build_bomb_state,
-    can_hit_enemy_if_place,
-    count_boxes_if_place,
-    current_tile_danger_time,
-    enemy_same_row_or_col_with_clear_path,
-    has_attack_pressure,
-    has_escape_after_placing_bomb,
-    nearest_enemy_distance,
-    nearest_valuable_bomb_spot_info,
-    prepare_policy_inputs,
-    to_env_action,
+_MODEL_V3_SPEC = importlib.util.spec_from_file_location(
+    "_v6_model_v3_base_train_base", _HERE / "_model_v3_base.py"
 )
+_MODEL_V3 = importlib.util.module_from_spec(_MODEL_V3_SPEC)
+assert _MODEL_V3_SPEC.loader is not None
+_MODEL_V3_SPEC.loader.exec_module(_MODEL_V3)
+
+MASK_WARMUP_STEPS = _MODEL_V3.MASK_WARMUP_STEPS
+CNNActorCriticV3 = _MODEL_V3.CNNActorCriticV3
+VALUE_BOMB_MASK_STEPS = _MODEL_V3.VALUE_BOMB_MASK_STEPS
+bfs_first_action_to_targets = _MODEL_V3.bfs_first_action_to_targets
+build_bomb_state = _MODEL_V3.build_bomb_state
+can_hit_enemy_if_place = _MODEL_V3.can_hit_enemy_if_place
+count_boxes_if_place = _MODEL_V3.count_boxes_if_place
+current_tile_danger_time = _MODEL_V3.current_tile_danger_time
+enemy_same_row_or_col_with_clear_path = _MODEL_V3.enemy_same_row_or_col_with_clear_path
+has_attack_pressure = _MODEL_V3.has_attack_pressure
+has_escape_after_placing_bomb = _MODEL_V3.has_escape_after_placing_bomb
+nearest_enemy_distance = _MODEL_V3.nearest_enemy_distance
+nearest_valuable_bomb_spot_info = _MODEL_V3.nearest_valuable_bomb_spot_info
+prepare_policy_inputs = _MODEL_V3.prepare_policy_inputs
+to_env_action = _MODEL_V3.to_env_action
 
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
