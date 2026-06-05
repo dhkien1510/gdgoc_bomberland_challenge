@@ -85,8 +85,8 @@ RESOURCE_CONTROL_REWARD = {
     "r_safe_item_progress_coef": 0.012,
     "r_safe_item_progress_clip": 0.025,
     "r_near_item_progress": 0.025,
-    "r_near_item_wrong_way": -0.010,
-    "r_ignore_near_safe_item": -0.015,
+    "r_near_item_wrong_way": -0.005,
+    "r_ignore_near_safe_item": -0.005,
     "near_safe_item_dist": 3,
     "tiebreak_start_step": 300,
     "tiebreak_kill_diff_coef": 0.08,
@@ -94,7 +94,7 @@ RESOURCE_CONTROL_REWARD = {
     "tiebreak_item_diff_coef": 0.04,
     "tiebreak_bomb_diff_coef": 0.0,
     "tiebreak_delta_clip": 0.03,
-    "resource_adv_bomb_coef": 0.02,
+    "resource_adv_bomb_coef": 0.0,
     "resource_adv_radius_coef": 0.02,
     "resource_adv_delta_clip": 0.03,
 }
@@ -254,6 +254,21 @@ def alive_agent_ids(obs: dict) -> list[int]:
     return [idx for idx in range(len(players)) if int(players[idx][2]) == 1]
 
 
+def active_bombs_owned(obs: dict, agent_id: int) -> int:
+    bombs = np.asarray(obs["bombs"], dtype=np.int64)
+    if bombs.size == 0:
+        return 0
+    if bombs.ndim == 1:
+        bombs = bombs.reshape(1, -1)
+    return int(np.sum(bombs[:, 3] == agent_id))
+
+
+def inferred_bomb_capacity(obs: dict, agent_id: int) -> int:
+    players = np.asarray(obs["players"], dtype=np.int64)
+    bombs_left = int(players[agent_id][3])
+    return bombs_left + active_bombs_owned(obs, agent_id)
+
+
 def has_clear_kill_opportunity(obs: dict, agent_id: int) -> bool:
     return has_escape_after_placing_bomb(obs, agent_id) and can_hit_enemy_if_place(obs, agent_id)
 
@@ -324,12 +339,12 @@ def resource_advantage(obs: dict, agent_id: int, reward_cfg: dict) -> float | No
     if len(alive_ids) != 2 or agent_id not in alive_ids:
         return None
     enemy_id = alive_ids[0] if alive_ids[1] == agent_id else alive_ids[1]
-    my_bombs_left = int(players[agent_id][3])
-    enemy_bombs_left = int(players[enemy_id][3])
+    my_capacity = inferred_bomb_capacity(obs, agent_id)
+    enemy_capacity = inferred_bomb_capacity(obs, enemy_id)
     my_radius = 1 + int(players[agent_id][4])
     enemy_radius = 1 + int(players[enemy_id][4])
     return (
-        reward_cfg["resource_adv_bomb_coef"] * (my_bombs_left - enemy_bombs_left)
+        reward_cfg["resource_adv_bomb_coef"] * (my_capacity - enemy_capacity)
         + reward_cfg["resource_adv_radius_coef"] * (my_radius - enemy_radius)
     )
 
@@ -477,7 +492,11 @@ def compute_reward(
             reward += reward_cfg["r_item_other"]
 
         kill_opportunity = has_clear_kill_opportunity(prev_obs, agent_id)
-        safe_for_item = prev_danger is None and curr_danger is None and not kill_opportunity
+        safe_for_item = (
+            (prev_danger is None or prev_danger > 2)
+            and (curr_danger is None or curr_danger > 2)
+            and not kill_opportunity
+        )
         if safe_for_item:
             prev_item_dist = nearest_safe_item_dist(prev_obs, agent_id)
             curr_item_dist = nearest_safe_item_dist(obs, agent_id)
