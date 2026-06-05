@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import copy
 import importlib.util
+import multiprocessing as mp
 import os
 import random
 import sys
@@ -68,6 +69,21 @@ CFG.update(
 DEVICE = base.DEVICE
 print(f"Using device: {DEVICE}")
 
+OPPONENT_CLASS_REGISTRY = {
+    "RandomAgent": base.RandomAgent,
+    "SimpleRuleAgent": base.SimpleRuleAgent,
+    "SmarterRuleAgent": base.SmarterRuleAgent,
+    "BoxFarmerAgent": base.BoxFarmerAgent,
+    "GeniusRuleAgent": base.GeniusRuleAgent,
+    "TacticalRuleAgent": base.TacticalRuleAgent,
+}
+
+_EVAL_WORKER_MODEL = None
+_EVAL_WORKER_DEVICE = None
+_EVAL_WORKER_CURRENT_STEP = 0
+_EVAL_WORKER_STAGE_NAME = ""
+_EVAL_WORKER_OPPONENT_CLASSES = None
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -87,6 +103,7 @@ def parse_args():
     parser.add_argument("--stage_actor_warmup_steps", type=int, default=CFG["stage_actor_warmup_steps"])
     parser.add_argument("--eval_easy_medium_matches", type=int, default=CFG["eval_easy_medium_matches"])
     parser.add_argument("--eval_hard_matches", type=int, default=CFG["eval_hard_matches"])
+    parser.add_argument("--eval_workers", type=int, default=1)
     parser.add_argument("--ckpt_dir", type=str, default=CFG["ckpt_dir"])
     parser.add_argument("--actor_init_path", type=str, default="")
     parser.add_argument("--bc_reference_path", type=str, default=str(_HERE / "bc_actor.pth"))
@@ -114,6 +131,7 @@ def apply_cli_overrides(args):
     CFG["stage_actor_warmup_steps"] = int(args.stage_actor_warmup_steps)
     CFG["eval_easy_medium_matches"] = int(args.eval_easy_medium_matches)
     CFG["eval_hard_matches"] = int(args.eval_hard_matches)
+    CFG["eval_workers"] = int(args.eval_workers)
     CFG["ckpt_dir"] = str(args.ckpt_dir)
     CFG["actor_init_path"] = str(args.actor_init_path).strip()
     CFG["bc_reference_path"] = str(args.bc_reference_path).strip()
@@ -130,6 +148,8 @@ def apply_cli_overrides(args):
         print("Warning: save_every > total_steps; only the final model may be saved.")
     if CFG["num_envs"] <= 0:
         raise ValueError("num_envs must be >= 1")
+    if CFG["eval_workers"] <= 0:
+        raise ValueError("eval_workers must be >= 1")
     if CFG["n_steps"] % CFG["num_envs"] != 0:
         raise ValueError("n_steps must be divisible by num_envs for vectorized rollout")
     if CFG["force_stage"]:
@@ -419,7 +439,43 @@ def model_action(model, obs, agent_id: int, deterministic: bool, current_step: i
     return env_action, int(action), next_state
 
 
-def run_eval_match(model, opponent_classes, seed: int, agent_id: int, current_step: int, stage_override=None):
+def model_action_with_device(
+    model,
+    device,
+    obs,
+    agent_id: int,
+    deterministic: bool,
+    current_step: int,
+    state,
+    episode_start: bool,
+):
+    _, map_feat, aux_feat, action_mask = prepare_policy_inputs(
+        obs,
+        agent_id,
+        current_step=current_step,
+        warmup_steps=CFG["mask_warmup_steps"],
+        value_bomb_mask_steps=VALUE_BOMB_MASK_STEPS,
+        eval_mode=False,
+    )
+    map_feat = map_feat.unsqueeze(0).to(device)
+    aux_feat = aux_feat.unsqueeze(0).to(device)
+    action_mask = action_mask.unsqueeze(0).to(device)
+    episode_start_tensor = torch.tensor([float(episode_start)], device=device)
+
+    with torch.no_grad():
+        action, next_state = model.get_action_inference(
+            map_feat,
+            aux_feat,
+            deterministic=deterministic,
+            action_mask=action_mask,
+            state=state,
+            episode_start=episode_start_tensor,
+        )
+    env_action = to_env_action(int(action), agent_id)
+    return env_action, int(action), next_state
+
+
+def _run_eval_match_impl(model, device, opponent_classes, seed: int, agent_id: int, current_step: int, stage_override=None):
     def _player_competition_tuple(player):
         stats = player.stats
         return (
@@ -450,7 +506,7 @@ def run_eval_match(model, opponent_classes, seed: int, agent_id: int, current_st
             for player_id in range(4)
             if player_id != agent_id
         }
-        actor_state = model.get_initial_actor_state(1, DEVICE)
+        actor_state = model.get_initial_actor_state(1, device)
         episode_start = True
         reward_stage = stage_override or get_training_stage(current_step)
 
@@ -462,8 +518,9 @@ def run_eval_match(model, opponent_classes, seed: int, agent_id: int, current_st
         while not done:
             actions = [0] * 4
             if env.players[agent_id].alive:
-                actions[agent_id], canonical_action, actor_state = model_action(
+                actions[agent_id], canonical_action, actor_state = model_action_with_device(
                     model,
+                    device,
                     obs,
                     agent_id,
                     deterministic=True,
@@ -578,16 +635,44 @@ def run_eval_match(model, opponent_classes, seed: int, agent_id: int, current_st
         }
 
 
-def evaluate_suite(
-    model,
-    opponent_classes,
-    num_matches: int,
-    seed_offset: int,
-    seed_base: int,
-    current_step: int,
-    stage_override=None,
-):
-    suite_rng = random.Random(seed_base + seed_offset)
+def run_eval_match(model, opponent_classes, seed: int, agent_id: int, current_step: int, stage_override=None):
+    return _run_eval_match_impl(
+        model,
+        DEVICE,
+        opponent_classes,
+        seed=seed,
+        agent_id=agent_id,
+        current_step=current_step,
+        stage_override=stage_override,
+    )
+
+
+def _eval_worker_init(model_state_dict, current_step: int, stage_name: str, opponent_class_names):
+    global _EVAL_WORKER_MODEL, _EVAL_WORKER_DEVICE, _EVAL_WORKER_CURRENT_STEP, _EVAL_WORKER_STAGE_NAME, _EVAL_WORKER_OPPONENT_CLASSES
+    _EVAL_WORKER_DEVICE = torch.device("cpu")
+    _EVAL_WORKER_MODEL = RecurrentActorCriticV6()
+    _EVAL_WORKER_MODEL.load_state_dict(model_state_dict)
+    _EVAL_WORKER_MODEL.to(_EVAL_WORKER_DEVICE)
+    _EVAL_WORKER_MODEL.eval()
+    _EVAL_WORKER_CURRENT_STEP = int(current_step)
+    _EVAL_WORKER_STAGE_NAME = str(stage_name)
+    _EVAL_WORKER_OPPONENT_CLASSES = [OPPONENT_CLASS_REGISTRY[name] for name in opponent_class_names]
+
+
+def _eval_worker_run(task):
+    seed, agent_id = task
+    return _run_eval_match_impl(
+        _EVAL_WORKER_MODEL,
+        _EVAL_WORKER_DEVICE,
+        _EVAL_WORKER_OPPONENT_CLASSES,
+        seed=int(seed),
+        agent_id=int(agent_id),
+        current_step=_EVAL_WORKER_CURRENT_STEP,
+        stage_override=base.get_stage_by_name(_EVAL_WORKER_STAGE_NAME),
+    )
+
+
+def _aggregate_eval_results(results, num_matches: int):
     rank_counts = [0, 0, 0, 0]
     totals = {
         "points": 0.0,
@@ -629,17 +714,7 @@ def evaluate_suite(
         "timeout_loss_by_bombs": 0.0,
         "timeout_loss_identical": 0.0,
     }
-    for match_idx in range(num_matches):
-        seed = seed_base + seed_offset + match_idx
-        agent_id = suite_rng.randrange(4)
-        result = run_eval_match(
-            model,
-            opponent_classes,
-            seed=seed,
-            agent_id=agent_id,
-            current_step=current_step,
-            stage_override=stage_override,
-        )
+    for result in results:
         if 0 <= int(result["rank"]) < len(rank_counts):
             rank_counts[int(result["rank"])] += 1
         for key in totals:
@@ -692,6 +767,55 @@ def evaluate_suite(
         "timeout_loss_by_bombs": totals["timeout_loss_by_bombs"] / denom,
         "timeout_loss_identical": totals["timeout_loss_identical"] / denom,
     }
+
+
+def evaluate_suite(
+    model,
+    opponent_classes,
+    num_matches: int,
+    seed_offset: int,
+    seed_base: int,
+    current_step: int,
+    stage_override=None,
+):
+    suite_rng = random.Random(seed_base + seed_offset)
+    tasks = [
+        (seed_base + seed_offset + match_idx, suite_rng.randrange(4))
+        for match_idx in range(num_matches)
+    ]
+    eval_workers = min(int(CFG.get("eval_workers", 1)), max(num_matches, 1))
+    use_parallel = eval_workers > 1 and num_matches > 1
+    if use_parallel:
+        model_state_cpu = {
+            key: value.detach().cpu()
+            for key, value in model.state_dict().items()
+        }
+        opponent_class_names = [cls.__name__ for cls in opponent_classes]
+        stage_name = (
+            stage_override["name"]
+            if isinstance(stage_override, dict)
+            else get_training_stage(current_step)["name"]
+        )
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(
+            processes=eval_workers,
+            initializer=_eval_worker_init,
+            initargs=(model_state_cpu, current_step, stage_name, opponent_class_names),
+        ) as pool:
+            results = pool.map(_eval_worker_run, tasks)
+    else:
+        results = [
+            run_eval_match(
+                model,
+                opponent_classes,
+                seed=seed,
+                agent_id=agent_id,
+                current_step=current_step,
+                stage_override=stage_override,
+            )
+            for seed, agent_id in tasks
+        ]
+    return _aggregate_eval_results(results, num_matches)
 
 
 def evaluate_policy(model, current_step: int):
@@ -1086,7 +1210,8 @@ def train():
     print("Training Recurrent PPO Agent V6 - BC Initialized")
     print(
         f"Device: {DEVICE} | Total steps: {CFG['total_steps']:,} | "
-        f"n_steps: {CFG['n_steps']:,} | seq_len: {CFG['seq_len']} | batch seq: {CFG['batch_size_sequences']}"
+        f"n_steps: {CFG['n_steps']:,} | seq_len: {CFG['seq_len']} | batch seq: {CFG['batch_size_sequences']} | "
+        f"eval_workers: {CFG['eval_workers']}"
     )
     print(f"{'=' * 60}\n")
 
@@ -1094,7 +1219,12 @@ def train():
         buffer.reset()
         model.eval()
         stage = get_training_stage(global_step)
+        rollout_time = 0.0
+        update_time = 0.0
+        eval_time = 0.0
+        checkpoint_time = 0.0
 
+        rollout_t0 = time.time()
         for _ in range(rollout_env_steps):
             stage = get_training_stage(global_step)
             if stage["name"] != active_stage_name:
@@ -1256,6 +1386,7 @@ def train():
             if next_bc_h is not None and next_bc_c is not None:
                 bc_reference_state = (next_bc_h, next_bc_c)
             global_step += num_envs
+        rollout_time = time.time() - rollout_t0
 
         model.train()
         model.set_actor_trainable(actor_trainable)
@@ -1286,6 +1417,7 @@ def train():
                 .numpy()
             )
 
+        update_t0 = time.time()
         stats = ppo_update(
             model,
             optimizer,
@@ -1294,6 +1426,7 @@ def train():
             actor_trainable=actor_trainable,
             bc_coef=CFG["bc_coef"] if bc_reference_model is not None else 0.0,
         )
+        update_time = time.time() - update_t0
 
         first_rate = np.mean(first_history) if first_history else 0.0
         bombs_per_episode = np.mean(bombs_per_episode_history) if bombs_per_episode_history else 0.0
@@ -1315,12 +1448,14 @@ def train():
             f"PG {stats['pg_loss']:+.4f} | Val {stats['val_loss']:.4f} | BC {stats['bc_loss']:.4f} | "
             f"Ent {stats['entropy']:.3f} | KL {stats['approx_kl']:.4f} | "
             f"Clip {stats['clip_fraction']:.2%} | Ratio {stats['ratio_mean']:.3f}+/-{stats['ratio_std']:.3f} | "
-            f"EV {stats['explained_variance']:.3f} | SPS {sps:.0f}"
+            f"EV {stats['explained_variance']:.3f} | SPS {sps:.0f} | "
+            f"T r/u/e/c {rollout_time:.1f}/{update_time:.1f}/{eval_time:.1f}/{checkpoint_time:.1f}s"
         )
 
         if global_step - last_save_step >= CFG["save_every"]:
             last_save_step = global_step
             ckpt_path = Path(CFG["ckpt_dir"]) / f"model_step{global_step}.pth"
+            checkpoint_t0 = time.time()
             torch.save(
                 {
                     "model": model.state_dict(),
@@ -1333,10 +1468,13 @@ def train():
                 },
                 ckpt_path,
             )
+            checkpoint_time = time.time() - checkpoint_t0
             print(f"  -> Saved checkpoint: {ckpt_path}")
 
             pool.add_recent_checkpoint(model.state_dict())
+            eval_t0 = time.time()
             eval_stats = evaluate_policy(model, current_step=global_step)
+            eval_time = time.time() - eval_t0
             print(
                 f"  -> Eval score {eval_stats['score']:.3f} | AvgRank {eval_stats['avg_rank']:.2f} | "
                 f"R0/1/2/3 {eval_stats['rank0_rate']:.0%}/{eval_stats['rank1_rate']:.0%}/"
@@ -1366,6 +1504,10 @@ def train():
                 f"{eval_stats['timeout_loss_by_boxes']:.2%}/"
                 f"{eval_stats['timeout_loss_by_items']:.2%}/"
                 f"{eval_stats['timeout_loss_by_bombs']:.2%}"
+            )
+            print(
+                f"     TIMING rollout {rollout_time:.1f}s | update {update_time:.1f}s | "
+                f"checkpoint {checkpoint_time:.1f}s | eval {eval_time:.1f}s"
             )
 
             if eval_stats["score"] >= best_eval_score:
