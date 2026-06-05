@@ -153,14 +153,24 @@ def apply_cli_overrides(args):
     if CFG["n_steps"] % CFG["num_envs"] != 0:
         raise ValueError("n_steps must be divisible by num_envs for vectorized rollout")
     if CFG["force_stage"]:
-        base.get_stage_by_name(CFG["force_stage"])
+        resolve_stage_by_name(CFG["force_stage"])
 
 
 def get_training_stage(current_step: int):
     forced_stage = str(CFG.get("force_stage", "")).strip()
     if forced_stage:
-        return base.get_stage_by_name(forced_stage)
+        return resolve_stage_by_name(forced_stage)
     return base.get_stage(current_step)
+
+
+def resolve_stage_by_name(stage_name: str):
+    getter = getattr(base, "get_stage_by_name", None)
+    if callable(getter):
+        return getter(stage_name)
+    for stage in getattr(base, "CURRICULUM_STAGES", []):
+        if stage.get("name") == stage_name:
+            return stage
+    raise KeyError(f"Unknown curriculum stage: {stage_name}")
 
 
 def _load_checkpoint(path: str | Path, map_location):
@@ -668,7 +678,7 @@ def _eval_worker_run(task):
         seed=int(seed),
         agent_id=int(agent_id),
         current_step=_EVAL_WORKER_CURRENT_STEP,
-        stage_override=base.get_stage_by_name(_EVAL_WORKER_STAGE_NAME),
+        stage_override=resolve_stage_by_name(_EVAL_WORKER_STAGE_NAME),
     )
 
 
