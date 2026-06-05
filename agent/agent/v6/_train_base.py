@@ -72,21 +72,23 @@ print(f"Using device: {DEVICE}")
 CURRICULUM_STAGES = copy.deepcopy(_BASE.CURRICULUM_STAGES)
 RESOURCE_CONTROL_STAGE_START = 1_700_000
 RESOURCE_CONTROL_REWARD = {
-    "r_item_capacity": 0.20,
-    "r_item_radius": 0.22,
+    "r_item_capacity": 0.24,
+    "r_item_radius": 0.28,
     "r_item_other": 0.05,
     "r_safe_item_progress_coef": 0.015,
     "r_safe_item_progress_clip": 0.03,
-    "r_ignore_near_safe_item": -0.015,
+    "r_near_item_progress": 0.035,
+    "r_near_item_wrong_way": -0.025,
+    "r_ignore_near_safe_item": -0.025,
     "near_safe_item_dist": 3,
     "tiebreak_start_step": 300,
     "tiebreak_kill_diff_coef": 0.08,
-    "tiebreak_box_diff_coef": 0.03,
-    "tiebreak_item_diff_coef": 0.04,
+    "tiebreak_box_diff_coef": 0.035,
+    "tiebreak_item_diff_coef": 0.05,
     "tiebreak_bomb_diff_coef": 0.0,
     "tiebreak_delta_clip": 0.03,
     "resource_adv_bomb_coef": 0.02,
-    "resource_adv_radius_coef": 0.015,
+    "resource_adv_radius_coef": 0.02,
     "resource_adv_delta_clip": 0.03,
 }
 CURRICULUM_STAGES[1]["end_step"] = 500_000
@@ -159,24 +161,24 @@ CURRICULUM_STAGES.append(
             "step_penalty": -0.01,
             "r_death": -1.0,
             "r_kill": 1.6,
-            "r_box_destroy": 0.025,
-            "r_item_collect": 0.08,
+            "r_box_destroy": 0.04,
+            "r_item_collect": 0.10,
             "r_bomb_place": 0.0,
-            "r_move_closer": 0.0005,
-            "r_move_away": -0.0005,
-            "r_best_enemy_dist": 0.004,
-            "r_danger_critical": -0.22,
-            "r_danger_soon": -0.09,
-            "r_danger_far": -0.02,
-            "r_escape_danger": 0.04,
-            "r_valuable_bomb_enemy": 0.24,
-            "r_valuable_bomb_box": 0.02,
-            "r_useless_bomb": -0.12,
-            "r_no_escape_bomb": -0.60,
+            "r_move_closer": 0.0003,
+            "r_move_away": -0.0003,
+            "r_best_enemy_dist": 0.002,
+            "r_danger_critical": -0.26,
+            "r_danger_soon": -0.11,
+            "r_danger_far": -0.025,
+            "r_escape_danger": 0.05,
+            "r_valuable_bomb_enemy": 0.18,
+            "r_valuable_bomb_box": 0.04,
+            "r_useless_bomb": -0.14,
+            "r_no_escape_bomb": -0.65,
             "rank_rewards": {0: 2.0, 1: 0.45, 2: -0.55, 3: -2.0},
-            "r_move_closer_bomb_spot": 0.001,
+            "r_move_closer_bomb_spot": 0.0005,
             "r_move_away_bomb_spot": -0.0005,
-            "r_best_bomb_spot_dist": 0.004,
+            "r_best_bomb_spot_dist": 0.002,
             "r_position_loop": -0.03,
             **RESOURCE_CONTROL_REWARD,
         },
@@ -469,7 +471,8 @@ def compute_reward(
 
         in_immediate_danger = prev_danger is not None and prev_danger <= 2
         kill_opportunity = has_clear_kill_opportunity(prev_obs, agent_id)
-        if not in_immediate_danger and not kill_opportunity:
+        safe_for_item = prev_danger is None and curr_danger is None and not kill_opportunity
+        if safe_for_item:
             prev_item_dist = nearest_safe_item_dist(prev_obs, agent_id)
             curr_item_dist = nearest_safe_item_dist(obs, agent_id)
             if prev_item_dist is not None and curr_item_dist is not None:
@@ -481,6 +484,11 @@ def compute_reward(
                         reward_cfg["r_safe_item_progress_clip"],
                     )
                 )
+                if prev_item_dist <= reward_cfg["near_safe_item_dist"]:
+                    if curr_item_dist < prev_item_dist:
+                        reward += reward_cfg["r_near_item_progress"]
+                    elif item_delta <= 0 and curr_item_dist > prev_item_dist:
+                        reward += reward_cfg["r_near_item_wrong_way"]
             if (
                 item_delta <= 0
                 and prev_item_dist is not None
