@@ -29,7 +29,10 @@ sys.modules.pop("_model_base", None)
 sys.modules.pop("_model_v3_base", None)
 sys.modules.pop("_train_base", None)
 
-import _train_base as base
+_TRAIN_BASE_SPEC = importlib.util.spec_from_file_location("_v6_train_base_train_ppo", _HERE / "_train_base.py")
+base = importlib.util.module_from_spec(_TRAIN_BASE_SPEC)
+assert _TRAIN_BASE_SPEC.loader is not None
+_TRAIN_BASE_SPEC.loader.exec_module(base)
 from bc_model import CNNLSTMBCActor
 
 _MODEL_SPEC = importlib.util.spec_from_file_location("_v6_model_train_ppo", _HERE / "model.py")
