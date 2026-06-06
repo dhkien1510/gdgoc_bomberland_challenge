@@ -48,7 +48,34 @@ _compute_explosion_tiles = _BASE._compute_explosion_tiles
 build_bomb_state = _BASE.build_bomb_state
 current_tile_danger_time = _BASE.current_tile_danger_time
 encode_obs = _BASE.encode_obs
-masked_logits = _BASE.masked_logits
+
+
+def masked_logits(logits: torch.Tensor, action_mask: torch.Tensor | None) -> torch.Tensor:
+    if action_mask is None:
+        return logits
+
+    if action_mask.dim() == 1:
+        action_mask = action_mask.unsqueeze(0)
+    action_mask = action_mask.to(device=logits.device, dtype=torch.bool)
+
+    if action_mask.shape != logits.shape:
+        try:
+            action_mask = action_mask.expand_as(logits)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"action_mask shape {tuple(action_mask.shape)} is incompatible with logits shape {tuple(logits.shape)}"
+            ) from exc
+
+    flat_logits = logits.reshape(-1, logits.shape[-1])
+    flat_mask = action_mask.reshape(-1, action_mask.shape[-1])
+
+    invalid_rows = ~flat_mask.any(dim=-1)
+    if invalid_rows.any():
+        flat_mask = flat_mask.clone()
+        flat_mask[invalid_rows, ACTION_STOP] = True
+
+    masked = flat_logits.masked_fill(~flat_mask, -1e9)
+    return masked.view_as(logits)
 
 
 def nearest_enemy_distance(obs: dict, agent_id: int) -> float:
