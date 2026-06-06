@@ -49,7 +49,7 @@ class Agent:
         self.recent_actions = deque(maxlen=12)
         self.episode_start = True
 
-        model_path = _HERE / "checkpoints/model_step1786400.pth"
+        model_path = _HERE / "checkpoints/model_step1914400.pth"
         bc_path = _HERE / "bc_actor.pth"
         if model_path.exists():
             self.mode = "ppo"

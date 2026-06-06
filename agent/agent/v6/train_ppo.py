@@ -619,6 +619,11 @@ def _run_eval_match_impl(model, device, opponent_classes, seed: int, agent_id: i
             "valuable_bomb_ratio": episode_metrics["valuable_bomb_ratio"],
             "repeat_position_rate": episode_metrics["repeat_position_rate"],
             "danger_steps": episode_metrics["danger_steps_per_episode"],
+            "safe_item_opportunities": episode_metrics.get("safe_item_opportunities", 0.0),
+            "safe_item_take_rate": episode_metrics.get("safe_item_take_rate", 0.0),
+            "near_item_ignore_rate": episode_metrics.get("near_item_ignore_rate", 0.0),
+            "items_per_box": episode_metrics.get("items_per_box", 0.0),
+            "boxes_per_bomb": episode_metrics.get("boxes_per_bomb", 0.0),
             "our_bombs": float(our_player.stats["bombs"]),
             "our_kills": float(our_player.stats["kills"]),
             "our_boxes": float(our_player.stats["boxes"]),
@@ -700,6 +705,11 @@ def _aggregate_eval_results(results, num_matches: int):
         "valuable_bomb_ratio": 0.0,
         "repeat_position_rate": 0.0,
         "danger_steps": 0.0,
+        "safe_item_opportunities": 0.0,
+        "safe_item_take_rate": 0.0,
+        "near_item_ignore_rate": 0.0,
+        "items_per_box": 0.0,
+        "boxes_per_bomb": 0.0,
         "our_bombs": 0.0,
         "our_kills": 0.0,
         "our_boxes": 0.0,
@@ -748,6 +758,11 @@ def _aggregate_eval_results(results, num_matches: int):
         "valuable_bomb_ratio": totals["valuable_bomb_ratio"] / denom,
         "repeat_position_rate": totals["repeat_position_rate"] / denom,
         "danger_steps": totals["danger_steps"] / denom,
+        "safe_item_opportunities": totals["safe_item_opportunities"] / denom,
+        "safe_item_take_rate": totals["safe_item_take_rate"] / denom,
+        "near_item_ignore_rate": totals["near_item_ignore_rate"] / denom,
+        "items_per_box": totals["items_per_box"] / denom,
+        "boxes_per_bomb": totals["boxes_per_bomb"] / denom,
         "total_points": totals["points"],
         "rank0_rate": rank_counts[0] / denom,
         "rank1_rate": rank_counts[1] / denom,
@@ -892,6 +907,11 @@ def evaluate_policy(model, current_step: int):
         "timeout_loss_by_items",
         "timeout_loss_by_bombs",
         "timeout_loss_identical",
+        "safe_item_opportunities",
+        "safe_item_take_rate",
+        "near_item_ignore_rate",
+        "items_per_box",
+        "boxes_per_bomb",
     ]
     aggregate = {}
     for key in aggregate_keys:
@@ -1150,6 +1170,11 @@ def train():
     danger_steps_history = deque(maxlen=100)
     unique_tiles_history = deque(maxlen=100)
     repeat_position_rate_history = deque(maxlen=100)
+    safe_item_take_rate_history = deque(maxlen=100)
+    near_item_ignore_rate_history = deque(maxlen=100)
+    items_per_box_history = deque(maxlen=100)
+    boxes_per_bomb_history = deque(maxlen=100)
+    safe_item_opportunities_history = deque(maxlen=100)
 
     env_obs = []
     env_agent_ids = []
@@ -1214,6 +1239,13 @@ def train():
             f"{eval_stats['timeout_loss_by_boxes']:.2%}/"
             f"{eval_stats['timeout_loss_by_items']:.2%}/"
             f"{eval_stats['timeout_loss_by_bombs']:.2%}"
+        )
+        print(
+            f"  ItemOpp {eval_stats['safe_item_opportunities']:.1f} | "
+            f"Take {eval_stats['safe_item_take_rate']:.2%} | "
+            f"Ignore {eval_stats['near_item_ignore_rate']:.2%} | "
+            f"I/Box {eval_stats['items_per_box']:.2f} | "
+            f"Box/Bomb {eval_stats['boxes_per_bomb']:.2f}"
         )
         return
 
@@ -1377,6 +1409,11 @@ def train():
                     danger_steps_history.append(episode_metrics["danger_steps_per_episode"])
                     unique_tiles_history.append(episode_metrics["unique_tiles_visited"])
                     repeat_position_rate_history.append(episode_metrics["repeat_position_rate"])
+                    safe_item_take_rate_history.append(episode_metrics.get("safe_item_take_rate", 0.0))
+                    near_item_ignore_rate_history.append(episode_metrics.get("near_item_ignore_rate", 0.0))
+                    items_per_box_history.append(episode_metrics.get("items_per_box", 0.0))
+                    boxes_per_bomb_history.append(episode_metrics.get("boxes_per_bomb", 0.0))
+                    safe_item_opportunities_history.append(episode_metrics.get("safe_item_opportunities", 0.0))
 
                     (
                         env_obs[env_idx],
@@ -1447,6 +1484,13 @@ def train():
         danger_steps_per_episode = np.mean(danger_steps_history) if danger_steps_history else 0.0
         unique_tiles_visited = np.mean(unique_tiles_history) if unique_tiles_history else 0.0
         repeat_position_rate = np.mean(repeat_position_rate_history) if repeat_position_rate_history else 0.0
+        safe_item_take_rate = np.mean(safe_item_take_rate_history) if safe_item_take_rate_history else 0.0
+        near_item_ignore_rate = np.mean(near_item_ignore_rate_history) if near_item_ignore_rate_history else 0.0
+        items_per_box = np.mean(items_per_box_history) if items_per_box_history else 0.0
+        boxes_per_bomb = np.mean(boxes_per_bomb_history) if boxes_per_bomb_history else 0.0
+        safe_item_opportunities = (
+            np.mean(safe_item_opportunities_history) if safe_item_opportunities_history else 0.0
+        )
         elapsed = time.time() - t_start
         sps = global_step / max(elapsed, 1.0)
 
@@ -1456,6 +1500,9 @@ def train():
             f"Bombs {bombs_per_episode:.2f} | VB {valuable_bomb_ratio:.2%} | UB {useless_bomb_ratio:.2%} | "
             f"NEB {no_escape_bomb_ratio:.2%} | Danger {danger_steps_per_episode:.1f} | "
             f"Tiles {unique_tiles_visited:.1f} | Repeat {repeat_position_rate:.2%} | "
+            f"ItemOpp {safe_item_opportunities:.1f} | ItemTake {safe_item_take_rate:.2%} | "
+            f"ItemIgn {near_item_ignore_rate:.2%} | I/Box {items_per_box:.2f} | "
+            f"B/Bo {boxes_per_bomb:.2f} | "
             f"PG {stats['pg_loss']:+.4f} | Val {stats['val_loss']:.4f} | BC {stats['bc_loss']:.4f} | "
             f"Ent {stats['entropy']:.3f} | KL {stats['approx_kl']:.4f} | "
             f"Clip {stats['clip_fraction']:.2%} | Ratio {stats['ratio_mean']:.3f}+/-{stats['ratio_std']:.3f} | "
@@ -1515,6 +1562,13 @@ def train():
                 f"{eval_stats['timeout_loss_by_boxes']:.2%}/"
                 f"{eval_stats['timeout_loss_by_items']:.2%}/"
                 f"{eval_stats['timeout_loss_by_bombs']:.2%}"
+            )
+            print(
+                f"     ItemOpp {eval_stats['safe_item_opportunities']:.1f} | "
+                f"Take {eval_stats['safe_item_take_rate']:.2%} | "
+                f"Ignore {eval_stats['near_item_ignore_rate']:.2%} | "
+                f"I/Box {eval_stats['items_per_box']:.2f} | "
+                f"Box/Bomb {eval_stats['boxes_per_bomb']:.2f}"
             )
             print(
                 f"     TIMING rollout {rollout_time:.1f}s | update {update_time:.1f}s | "

@@ -192,6 +192,83 @@ CURRICULUM_STAGES.append(
     }
 )
 
+ITEM_CONTROL_EASY_REWARD = copy.deepcopy(CURRICULUM_STAGES[-1]["reward"])
+
+ITEM_CONTROL_EASY_REWARD.update(
+    {
+        # Tổng quát
+        "step_penalty": -0.008,
+        "r_death": -0.9,
+
+        # Combat giảm nhẹ để agent không chase quá gắt
+        "r_kill": 1.2,
+        "r_move_closer": 0.0003,
+        "r_move_away": -0.0003,
+        "r_best_enemy_dist": 0.002,
+
+        # Box + item mạnh hơn
+        "r_box_destroy": 0.04,
+        "r_item_collect": 0.12,
+        "r_item_capacity": 0.30,
+        "r_item_radius": 0.32,
+        "r_item_other": 0.05,
+
+        # Bomb vẫn giữ value, không spam
+        "r_bomb_place": 0.0,
+        "r_valuable_bomb_enemy": 0.18,
+        "r_valuable_bomb_box": 0.04,
+        "r_useless_bomb": -0.12,
+        "r_no_escape_bomb": -0.60,
+
+        # Danger
+        "r_danger_critical": -0.24,
+        "r_danger_soon": -0.10,
+        "r_danger_far": -0.025,
+        "r_escape_danger": 0.05,
+
+        # Bomb spot vẫn có nhưng nhẹ
+        "r_move_closer_bomb_spot": 0.001,
+        "r_move_away_bomb_spot": -0.0005,
+        "r_best_bomb_spot_dist": 0.004,
+
+        # Item navigation mạnh hơn một chút
+        "r_safe_item_progress_coef": 0.015,
+        "r_safe_item_progress_clip": 0.03,
+        "r_near_item_progress": 0.04,
+        "r_near_item_wrong_way": -0.005,
+        "r_ignore_near_safe_item": -0.005,
+        "near_safe_item_dist": 3,
+
+        # Tie-break vẫn giữ, không reward bomb diff
+        "tiebreak_kill_diff_coef": 0.08,
+        "tiebreak_box_diff_coef": 0.03,
+        "tiebreak_item_diff_coef": 0.05,
+        "tiebreak_bomb_diff_coef": 0.0,
+
+        # 1v1 resource
+        "resource_adv_bomb_coef": 0.0,
+        "resource_adv_radius_coef": 0.02,
+
+        # Rank reward nhẹ hơn resource_control hard một chút
+        "rank_rewards": {0: 1.6, 1: 0.35, 2: -0.45, 3: -1.6},
+    }
+)
+
+CURRICULUM_STAGES.append(
+    {
+        "name": "phase_item_control_easy",
+        "end_step": None,
+        "baseline_bots": [
+            (SimpleRuleAgent, 0.25),
+            (SmarterRuleAgent, 0.45),
+            (BoxFarmerAgent, 0.20),
+            (TacticalRuleAgent, 0.10),
+        ],
+        "selfplay_prob": 0.05,
+        "reward": ITEM_CONTROL_EASY_REWARD,
+    }
+)
+
 
 def get_stage(current_step: int):
     for stage in CURRICULUM_STAGES:
@@ -364,6 +441,11 @@ def make_episode_context(obs: dict, agent_id: int) -> dict:
         "useless_bombs": 0,
         "no_escape_bombs": 0,
         "danger_steps": 0,
+        "safe_item_opportunities": 0,
+        "safe_item_taken": 0,
+        "near_item_ignored": 0,
+        "item_progress_events": 0,
+        "item_progress_reward_total": 0.0,
         "visited_tiles": {(start_row, start_col)},
         "repeat_steps": 0,
         "recent_positions": recent_positions,
@@ -372,7 +454,28 @@ def make_episode_context(obs: dict, agent_id: int) -> dict:
 
 
 def summarize_episode_metrics(episode_ctx: dict, final_stats: dict) -> dict:
-    return _BASE.summarize_episode_metrics(episode_ctx, final_stats)
+    metrics = _BASE.summarize_episode_metrics(episode_ctx, final_stats)
+
+    safe_item_opps = int(episode_ctx.get("safe_item_opportunities", 0))
+    safe_item_taken = int(episode_ctx.get("safe_item_taken", 0))
+    near_item_ignored = int(episode_ctx.get("near_item_ignored", 0))
+
+    boxes = max(int(final_stats.get("boxes", 0)), 1)
+    bombs = max(int(final_stats.get("bombs", 0)), 1)
+
+    metrics.update(
+        {
+            "safe_item_opportunities": float(safe_item_opps),
+            "safe_item_taken": float(safe_item_taken),
+            "safe_item_take_rate": safe_item_taken / max(safe_item_opps, 1),
+            "near_item_ignore_rate": near_item_ignored / max(safe_item_opps, 1),
+            "items_per_box": float(final_stats.get("items", 0)) / boxes,
+            "boxes_per_bomb": float(final_stats.get("boxes", 0)) / bombs,
+            "item_progress_events": float(episode_ctx.get("item_progress_events", 0)),
+            "item_progress_reward_total": float(episode_ctx.get("item_progress_reward_total", 0.0)),
+        }
+    )
+    return metrics
 
 
 def compute_reward(
@@ -481,7 +584,7 @@ def compute_reward(
     if curr_danger is None and is_position_loop(episode_ctx["recent_positions"]):
         reward += reward_cfg["r_position_loop"]
 
-    if stage["name"] == "phase_resource_control":
+    if stage["name"] in ("phase_resource_control", "phase_item_control_easy"):
         item_delta = curr_stats["items"] - prev_stats["items"]
         picked_item_type = infer_picked_item_type(prev_obs, obs, agent_id, item_delta)
         if picked_item_type == "capacity":
@@ -500,20 +603,38 @@ def compute_reward(
         if safe_for_item:
             prev_item_dist = nearest_safe_item_dist(prev_obs, agent_id)
             curr_item_dist = nearest_safe_item_dist(obs, agent_id)
+
+            if (
+                prev_item_dist is not None
+                and prev_item_dist <= reward_cfg["near_safe_item_dist"]
+            ):
+                episode_ctx["safe_item_opportunities"] += 1
+
+                if item_delta > 0:
+                    episode_ctx["safe_item_taken"] += 1
+
             if prev_item_dist is not None and curr_item_dist is not None:
                 item_progress = prev_item_dist - curr_item_dist
-                reward += float(
+                progress_reward = float(
                     np.clip(
                         reward_cfg["r_safe_item_progress_coef"] * item_progress,
                         -reward_cfg["r_safe_item_progress_clip"],
                         reward_cfg["r_safe_item_progress_clip"],
                     )
                 )
+                reward += progress_reward
+
+                if item_progress != 0:
+                    episode_ctx["item_progress_events"] += 1
+                    episode_ctx["item_progress_reward_total"] += progress_reward
+
                 if prev_item_dist <= reward_cfg["near_safe_item_dist"]:
                     if curr_item_dist < prev_item_dist:
                         reward += reward_cfg["r_near_item_progress"]
                     elif item_delta <= 0 and curr_item_dist > prev_item_dist:
                         reward += reward_cfg["r_near_item_wrong_way"]
+                        episode_ctx["near_item_ignored"] += 1
+
             if (
                 item_delta <= 0
                 and prev_item_dist is not None
