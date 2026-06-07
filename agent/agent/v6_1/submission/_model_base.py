@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 
 _HERE = Path(__file__).resolve().parent
-_BASE_PATH = _HERE.parent / "v5_1" / "_model_base.py"
+_BASE_PATH = _HERE / "_model_base_v5_1.py"
 _SPEC = importlib.util.spec_from_file_location("_v5_1_model_base", _BASE_PATH)
 _BASE = importlib.util.module_from_spec(_SPEC)
 assert _SPEC.loader is not None

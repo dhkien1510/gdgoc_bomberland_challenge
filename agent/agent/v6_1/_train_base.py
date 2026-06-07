@@ -64,8 +64,8 @@ from tactical_rule_agent import TacticalRuleAgent
 from engine.game import BomberEnv
 from engine.map import Map
 
-_BASE_PATH = _HERE.parent / "v5_1" / "_train_base.py"
-_SPEC = importlib.util.spec_from_file_location("_v5_1_train_base", _BASE_PATH)
+_BASE_PATH = _HERE / "_train_base_v5_1.py"
+_SPEC = importlib.util.spec_from_file_location("_v6_1_train_base_v5_1", _BASE_PATH)
 _BASE = importlib.util.module_from_spec(_SPEC)
 assert _SPEC.loader is not None
 _SPEC.loader.exec_module(_BASE)
