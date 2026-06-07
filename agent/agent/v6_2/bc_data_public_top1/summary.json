@@ -1,0 +1,15 @@
+{
+  "manifest": "data\\public_replays\\agent_2f875942_top50\\manifest.csv",
+  "output_dir": "agent\\agent\\v6_2\\bc_data_public_top1",
+  "selected_matches": 150,
+  "processed_matches": 150,
+  "missing_matches": 0,
+  "saved_steps": 70510,
+  "masked_steps_seen": 0,
+  "episodes_per_shard": 100,
+  "rank_range": [
+    0,
+    1
+  ],
+  "agent_id": "2f875942-8faf-4f9c-8008-9b6acf48d3e0"
+}
