@@ -277,10 +277,16 @@ ITEM_REWARD_COMMON = {
     "r_item_other": 0.05,
     "r_safe_item_progress_coef": 0.015,
     "r_safe_item_progress_clip": 0.03,
-    "r_near_item_progress": 0.04,
-    "r_near_item_wrong_way": -0.005,
-    "r_ignore_near_safe_item": -0.005,
+    "r_near_item_progress": 0.05,
+    "r_near_item_wrong_way": -0.015,
+    "r_ignore_near_safe_item": -0.02,
+    "r_contested_item_progress_bonus": 0.025,
+    "r_contested_item_take_bonus": 0.06,
+    "r_destroy_item_capacity": -0.18,
+    "r_destroy_item_radius": -0.20,
+    "r_destroy_item_other": -0.06,
     "near_safe_item_dist": 3,
+    "item_priority_dist": 4,
     "tiebreak_start_step": 300,
     "tiebreak_kill_diff_coef": 0.08,
     "tiebreak_box_diff_coef": 0.03,
@@ -578,19 +584,134 @@ def has_clear_kill_opportunity(obs: dict, agent_id: int) -> bool:
 
 
 def nearest_safe_item_dist(obs: dict, agent_id: int) -> int | None:
+    info = nearest_safe_item_info(obs, agent_id)
+    if info is None:
+        return None
+    return int(info["dist"])
+
+
+def nearest_safe_item_info(obs: dict, agent_id: int) -> dict | None:
     grid = np.asarray(obs["map"], dtype=np.int64)
-    targets = {
-        (row, col)
+    targets = [
+        (row, col, int(grid[row, col]))
         for row in range(1, grid.shape[0] - 1)
         for col in range(1, grid.shape[1] - 1)
         if int(grid[row, col]) in (Map.ITEM_RADIUS, Map.ITEM_CAPACITY)
-    }
+    ]
     if not targets:
         return None
-    _first_action, dist = bfs_first_action_to_targets(obs, agent_id, targets, avoid_danger_leq=2)
+    target_positions = {(row, col) for row, col, _tile in targets}
+    _first_action, dist = bfs_first_action_to_targets(obs, agent_id, target_positions, avoid_danger_leq=2)
     if dist >= 999:
         return None
-    return int(dist)
+
+    players = np.asarray(obs["players"], dtype=np.int64)
+    my_row = int(players[agent_id][0])
+    my_col = int(players[agent_id][1])
+
+    best_pos = None
+    best_tile = None
+    best_manhattan = 999
+    for row, col, tile in targets:
+        md = abs(row - my_row) + abs(col - my_col)
+        if md < best_manhattan:
+            best_manhattan = md
+            best_pos = (row, col)
+            best_tile = tile
+
+    contested = False
+    if best_pos is not None:
+        enemy_min = 999
+        for enemy_id in alive_agent_ids(obs):
+            if enemy_id == agent_id:
+                continue
+            er = int(players[enemy_id][0])
+            ec = int(players[enemy_id][1])
+            enemy_min = min(enemy_min, abs(er - best_pos[0]) + abs(ec - best_pos[1]))
+        contested = enemy_min <= best_manhattan + 1
+
+    return {
+        "dist": int(dist),
+        "pos": best_pos,
+        "tile": best_tile,
+        "contested": bool(contested),
+    }
+
+
+def _item_positions(obs: dict) -> dict[tuple[int, int], int]:
+    grid = np.asarray(obs["map"], dtype=np.int64)
+    items: dict[tuple[int, int], int] = {}
+    for row in range(1, grid.shape[0] - 1):
+        for col in range(1, grid.shape[1] - 1):
+            tile = int(grid[row, col])
+            if tile in (Map.ITEM_RADIUS, Map.ITEM_CAPACITY):
+                items[(row, col)] = tile
+    return items
+
+
+def _bomb_blast_tiles(obs: dict, row: int, col: int, radius: int) -> set[tuple[int, int]]:
+    grid = np.asarray(obs["map"], dtype=np.int64)
+    tiles = {(int(row), int(col))}
+    for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        for step in range(1, max(int(radius), 0) + 1):
+            nr = int(row) + dr * step
+            nc = int(col) + dc * step
+            if nr < 0 or nr >= grid.shape[0] or nc < 0 or nc >= grid.shape[1]:
+                break
+            cell = int(grid[nr, nc])
+            if cell == Map.WALL:
+                break
+            tiles.add((nr, nc))
+            if cell == Map.BOX:
+                break
+    return tiles
+
+
+def destroyed_items_by_own_bomb(
+    prev_obs: dict,
+    obs: dict,
+    agent_id: int,
+    all_prev_stats: list[dict] | None = None,
+    all_curr_stats: list[dict] | None = None,
+) -> list[int]:
+    prev_items = _item_positions(prev_obs)
+    if not prev_items:
+        return []
+
+    curr_items = _item_positions(obs)
+    removed_positions = [pos for pos in prev_items if pos not in curr_items]
+    if not removed_positions:
+        return []
+
+    picked_positions: set[tuple[int, int]] = set()
+    if all_prev_stats and all_curr_stats:
+        players = np.asarray(obs["players"], dtype=np.int64)
+        for player_id in range(min(len(all_prev_stats), len(all_curr_stats), len(players))):
+            prev_item_count = int(all_prev_stats[player_id].get("items", 0))
+            curr_item_count = int(all_curr_stats[player_id].get("items", 0))
+            if curr_item_count > prev_item_count:
+                picked_positions.add((int(players[player_id][0]), int(players[player_id][1])))
+
+    own_blast_tiles: set[tuple[int, int]] = set()
+    bombs = np.asarray(prev_obs["bombs"], dtype=np.int64)
+    if bombs.size > 0:
+        if bombs.ndim == 1:
+            bombs = bombs.reshape(1, -1)
+        players_prev = np.asarray(prev_obs["players"], dtype=np.int64)
+        for bomb in bombs:
+            owner = int(bomb[3])
+            if owner != agent_id:
+                continue
+            radius = 1 + int(players_prev[owner][4])
+            own_blast_tiles.update(_bomb_blast_tiles(prev_obs, int(bomb[0]), int(bomb[1]), radius))
+
+    destroyed_tiles = []
+    for pos in removed_positions:
+        if pos in picked_positions:
+            continue
+        if pos in own_blast_tiles:
+            destroyed_tiles.append(prev_items[pos])
+    return destroyed_tiles
 
 
 def infer_picked_item_type(prev_obs: dict, obs: dict, agent_id: int, item_delta: int) -> str | None:
@@ -822,14 +943,20 @@ def compute_reward(
             reward += reward_cfg["r_item_other"]
 
         kill_opportunity = has_clear_kill_opportunity(prev_obs, agent_id)
+        prev_item_info = nearest_safe_item_info(prev_obs, agent_id)
+        curr_item_info = nearest_safe_item_info(obs, agent_id)
+        item_priority_override = (
+            prev_item_info is not None
+            and prev_item_info["dist"] <= reward_cfg["item_priority_dist"]
+        )
         safe_for_item = (
             (prev_danger is None or prev_danger > 2)
             and (curr_danger is None or curr_danger > 2)
-            and not kill_opportunity
+            and (not kill_opportunity or item_priority_override)
         )
         if safe_for_item:
-            prev_item_dist = nearest_safe_item_dist(prev_obs, agent_id)
-            curr_item_dist = nearest_safe_item_dist(obs, agent_id)
+            prev_item_dist = None if prev_item_info is None else int(prev_item_info["dist"])
+            curr_item_dist = None if curr_item_info is None else int(curr_item_info["dist"])
 
             if (
                 prev_item_dist is not None
@@ -839,6 +966,8 @@ def compute_reward(
 
                 if item_delta > 0:
                     episode_ctx["safe_item_taken"] += 1
+                    if bool(prev_item_info.get("contested", False)):
+                        reward += reward_cfg["r_contested_item_take_bonus"]
 
             if prev_item_dist is not None and curr_item_dist is not None:
                 item_progress = prev_item_dist - curr_item_dist
@@ -858,6 +987,8 @@ def compute_reward(
                 if prev_item_dist <= reward_cfg["near_safe_item_dist"]:
                     if curr_item_dist < prev_item_dist:
                         reward += reward_cfg["r_near_item_progress"]
+                        if bool(prev_item_info.get("contested", False)):
+                            reward += reward_cfg["r_contested_item_progress_bonus"]
                     elif item_delta <= 0 and curr_item_dist > prev_item_dist:
                         reward += reward_cfg["r_near_item_wrong_way"]
                         episode_ctx["near_item_ignored"] += 1
@@ -870,6 +1001,21 @@ def compute_reward(
                 and curr_item_dist > prev_item_dist
             ):
                 reward += reward_cfg["r_ignore_near_safe_item"]
+
+        destroyed_items = destroyed_items_by_own_bomb(
+            prev_obs,
+            obs,
+            agent_id,
+            all_prev_stats=all_prev_stats,
+            all_curr_stats=all_curr_stats,
+        )
+        for destroyed_tile in destroyed_items:
+            if destroyed_tile == Map.ITEM_CAPACITY:
+                reward += reward_cfg["r_destroy_item_capacity"]
+            elif destroyed_tile == Map.ITEM_RADIUS:
+                reward += reward_cfg["r_destroy_item_radius"]
+            else:
+                reward += reward_cfg["r_destroy_item_other"]
 
         alive_count = len(alive_agent_ids(obs))
         if (
