@@ -74,6 +74,9 @@ CFG.update(
 DEVICE = base.DEVICE
 print(f"Using device: {DEVICE}")
 
+_SEEN_LOAD_WARNINGS: set[str] = set()
+_SEEN_EXPANDED_PARAMS: set[tuple[str, str, tuple[int, ...], tuple[int, ...]]] = set()
+
 OPPONENT_CLASS_REGISTRY = {
     "RandomAgent": base.RandomAgent,
     "SimpleRuleAgent": base.SimpleRuleAgent,
@@ -397,7 +400,10 @@ def load_state_dict_expand_input(module: nn.Module, state_dict: dict, label: str
             new_param[:, : old.shape[1]] = old
             new_param[:, old.shape[1] :] = 0.0
             loaded[name] = new_param
-            print(f"[{label}] Expanded input weight: {name} {tuple(old.shape)} -> {tuple(param.shape)}")
+            expansion_key = (label, name, tuple(old.shape), tuple(param.shape))
+            if expansion_key not in _SEEN_EXPANDED_PARAMS:
+                _SEEN_EXPANDED_PARAMS.add(expansion_key)
+                print(f"[{label}] Expanded input weight: {name} {tuple(old.shape)} -> {tuple(param.shape)}")
             continue
 
         loaded[name] = param
@@ -562,13 +568,16 @@ class ActiveOpponentPoolV6(base.ActiveOpponentPool):
         self.external_checkpoints = list(external_checkpoints or [])
         self.external_prob = float(external_prob)
 
-    def _load_checkpoint_opponent(self, checkpoint, agent_id: int, current_step: int):
+    def _load_checkpoint_opponent(self, checkpoint, agent_id: int, current_step: int, source_label: str = "opponent"):
         model = self.model_factory()
         try:
             model.load_state_dict(checkpoint)
         except RuntimeError as exc:
-            print(f"External/self-play strict load failed; trying expanded-input load: {exc}")
-            load_state_dict_expand_input(model, checkpoint, label="opponent")
+            warning_key = f"{source_label}|{type(exc).__name__}|{exc}"
+            if warning_key not in _SEEN_LOAD_WARNINGS:
+                _SEEN_LOAD_WARNINGS.add(warning_key)
+                print(f"{source_label} strict load failed; trying expanded-input load: {exc}")
+            load_state_dict_expand_input(model, checkpoint, label=source_label)
         model.to(DEVICE)
         model.eval()
         return ModelOpponentV6(model, agent_id, current_step)
@@ -580,8 +589,13 @@ class ActiveOpponentPoolV6(base.ActiveOpponentPool):
         can_external = bool(self.external_checkpoints) and self.external_prob > 0.0
 
         if can_external and random.random() < self.external_prob:
-            _label, checkpoint = random.choice(self.external_checkpoints)
-            return self._load_checkpoint_opponent(checkpoint, agent_id, current_step)
+            source_label, checkpoint = random.choice(self.external_checkpoints)
+            return self._load_checkpoint_opponent(
+                checkpoint,
+                agent_id,
+                current_step,
+                source_label=f"external:{source_label}",
+            )
 
         if can_selfplay and random.random() < selfplay_prob:
             source_items = []
@@ -591,8 +605,18 @@ class ActiveOpponentPoolV6(base.ActiveOpponentPool):
                 source_items.append(("recent", 0.6))
             source = base.weighted_choice(source_items)
             if source == "best":
-                return self._load_checkpoint_opponent(random.choice(list(self.best_checkpoints)), agent_id, current_step)
-            return self._load_checkpoint_opponent(random.choice(list(self.recent_checkpoints)), agent_id, current_step)
+                return self._load_checkpoint_opponent(
+                    random.choice(list(self.best_checkpoints)),
+                    agent_id,
+                    current_step,
+                    source_label="selfplay:best",
+                )
+            return self._load_checkpoint_opponent(
+                random.choice(list(self.recent_checkpoints)),
+                agent_id,
+                current_step,
+                source_label="selfplay:recent",
+            )
 
         cls = base.weighted_choice(stage["baseline_bots"])
         return cls(agent_id)
