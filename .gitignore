@@ -13,3 +13,5 @@ submissions/
 backups/
 tests/
 training/
+*.pth
+*.zip

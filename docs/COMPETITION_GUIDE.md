@@ -189,7 +189,7 @@ submission.zip
 The `agent.py` file **must** define an `Agent` class with the following interface:
 
 ```python
-class Agent:
+class Agent:`
     def __init__(self, agent_id: int):
         # agent_id: 0, 1, 2, or 3
         self.agent_id = agent_id

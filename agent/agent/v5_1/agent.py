@@ -29,7 +29,11 @@ class Agent:
 
         ckpt_path = _HERE / "model.pth"
         if ckpt_path.exists():
-            checkpoint = torch.load(ckpt_path, map_location=self.device)
+            checkpoint = torch.load(
+                ckpt_path,
+                map_location=self.device,
+                weights_only=False,
+            )
             state_dict = checkpoint.get("model", checkpoint) if isinstance(checkpoint, dict) else checkpoint
             self.model.load_state_dict(state_dict)
             print(f"[Agent {agent_id}] Loaded model from {ckpt_path}")

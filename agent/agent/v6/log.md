@@ -27,3 +27,7 @@ Epoch  1 | train_loss 1.7860 | val_loss 1.7411 | acc/raw 38.58%/19.76% | bomb P/
   -> Overfit train_eval acc/raw 37.80%/24.39% | bomb P/R 0.00%/0.00% | bomb pred/true 0.06%/9.95% | illegal_pre_mask 31.45% | invalid_mass 0.3177
   -> Confusion STOP:5,30,1,20,11,6 | LEFT:0,819,0,0,0,0 | RIGHT:0,683,53,118,35,0 | UP:0,254,0,311,3,0 | DOWN:0,296,0,310,48,0 | BOMB:0,210,2,89,6,0
   -> Overfit Train Confusion STOP:3,19,2,18,3,1 | LEFT:0,380,0,0,0,0 | RIGHT:0,314,28,44,16,0 | UP:0,100,0,144,0,0 | DOWN:0,146,0,151,34,0 | BOMB:0,109,3,40,3,0
+Epoch 44 | train_loss 1.7687 | val_loss 1.7309 | acc/raw 40.82%/26.86% | bomb P/R 0.00%/0.00% | bomb pred/true 0.18%/9.27% | danger 64.44% | valuable 28.54% | illegal_pre_mask 31.63% | raw_ce 1.7687 | masked_ce 1.3134 | invalid_mass train/val 0.3120/0.3054
+  -> Overfit train_eval acc/raw 40.76%/25.80% | bomb P/R 0.00%/0.00% | bomb pred/true 0.06%/9.95% | illegal_pre_mask 33.25% | invalid_mass 0.3122
+  -> Confusion STOP:5,9,42,9,2,6 | LEFT:0,202,616,0,1,0 | RIGHT:0,0,889,0,0,0 | UP:0,106,219,239,4,0 | DOWN:0,103,304,231,16,0 | BOMB:0,53,193,59,2,0
+  -> Overfit Train Confusion STOP:3,4,25,11,2,1 | LEFT:0,105,275,0,0,0 | RIGHT:0,0,402,0,0,0 | UP:0,34,104,106,0,0 | DOWN:0,44,145,123,19,0 | BOMB:0,36,89,28,2,0

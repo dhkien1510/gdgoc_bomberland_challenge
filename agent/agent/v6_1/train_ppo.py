@@ -34,6 +34,7 @@ base = importlib.util.module_from_spec(_TRAIN_BASE_SPEC)
 assert _TRAIN_BASE_SPEC.loader is not None
 _TRAIN_BASE_SPEC.loader.exec_module(base)
 from bc_model import CNNLSTMBCActor
+from v6_submission_agent import V6SubmissionAgent
 
 _MODEL_SPEC = importlib.util.spec_from_file_location("_v6_model_train_ppo", _HERE / "model.py")
 _MODEL = importlib.util.module_from_spec(_MODEL_SPEC)
@@ -84,6 +85,7 @@ OPPONENT_CLASS_REGISTRY = {
     "BoxFarmerAgent": base.BoxFarmerAgent,
     "GeniusRuleAgent": base.GeniusRuleAgent,
     "TacticalRuleAgent": base.TacticalRuleAgent,
+    "V6SubmissionAgent": V6SubmissionAgent,
 }
 
 _EVAL_WORKER_MODEL = None
@@ -1147,7 +1149,7 @@ def evaluate_policy(model, current_step: int):
     )
     hard = evaluate_suite(
         model,
-        opponent_classes=[base.GeniusRuleAgent, base.TacticalRuleAgent],
+        opponent_classes=[V6SubmissionAgent, base.TacticalRuleAgent],
         num_matches=CFG["eval_hard_matches"],
         seed_offset=10_000,
         seed_base=CFG["eval_seed_base"],

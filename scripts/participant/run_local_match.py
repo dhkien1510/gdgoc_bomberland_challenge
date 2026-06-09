@@ -11,7 +11,7 @@ import argparse
 import sys
 from pathlib import Path
 
-parent_dir = Path(__file__).resolve().parent.parent
+parent_dir = Path(__file__).resolve().parent.parent.parent
 # Add parent directory to sys.path if not already present
 if str(parent_dir) not in sys.path:
     sys.path.insert(0, str(parent_dir))
@@ -164,7 +164,7 @@ if __name__ == "__main__":
     
     if args.visualize:
         from scripts.participant.visualizer import run_simple_viewer
-
+        print("visualize")
         run_simple_viewer(
             agent_paths=args.agent_paths,
             num_episodes=args.num_episodes,
