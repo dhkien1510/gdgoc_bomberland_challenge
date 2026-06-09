@@ -84,7 +84,7 @@ class Agent:
 
         model_candidates = [
             _HERE / "model.pth",
-            _HERE / "checkpoints/model_step25600.pth",
+            _HERE / "model_step1331200.pth",
         ]
         model_path = next((path for path in model_candidates if path.exists()), None)
         bc_path = _HERE / "bc_actor.pth"

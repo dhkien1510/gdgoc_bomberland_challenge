@@ -65,6 +65,8 @@ CFG.update(
             str(_HERE / "model.pth"),
             str(_HERE.parent / "v5_2" / "model.pth"),
         ],
+        "external_opponent_paths": [],
+        "external_opponent_prob": 0.0,
         "ckpt_dir": str(_HERE / "checkpoints"),
     }
 )
@@ -113,6 +115,8 @@ def parse_args():
     parser.add_argument("--resume_checkpoint", type=str, default="")
     parser.add_argument("--resume_global_step_override", type=int, default=-1)
     parser.add_argument("--force_stage", type=str, default="")
+    parser.add_argument("--external_opponent_paths", type=str, default="")
+    parser.add_argument("--external_opponent_prob", type=float, default=CFG["external_opponent_prob"])
     parser.add_argument("--eval_only", type=int, default=0)
     return parser.parse_args()
 
@@ -141,6 +145,14 @@ def apply_cli_overrides(args):
     CFG["resume_checkpoint"] = str(args.resume_checkpoint).strip()
     CFG["resume_global_step_override"] = int(args.resume_global_step_override)
     CFG["force_stage"] = str(args.force_stage).strip()
+    raw_external_paths = str(args.external_opponent_paths).strip()
+    CFG["external_opponent_paths"] = [
+        part.strip()
+        for chunk in raw_external_paths.split(";")
+        for part in chunk.split(",")
+        if part.strip()
+    ]
+    CFG["external_opponent_prob"] = float(args.external_opponent_prob)
     CFG["eval_only"] = bool(int(args.eval_only))
     if CFG["initial_actor_warmup_steps"] >= CFG["total_steps"]:
         print(
@@ -153,6 +165,8 @@ def apply_cli_overrides(args):
         raise ValueError("num_envs must be >= 1")
     if CFG["eval_workers"] <= 0:
         raise ValueError("eval_workers must be >= 1")
+    if CFG["external_opponent_prob"] < 0.0 or CFG["external_opponent_prob"] > 1.0:
+        raise ValueError("external_opponent_prob must be between 0 and 1")
     if CFG["n_steps"] % CFG["num_envs"] != 0:
         raise ValueError("n_steps must be divisible by num_envs for vectorized rollout")
     if CFG["force_stage"]:
@@ -536,9 +550,25 @@ class SequenceRolloutBuffer:
 
 
 class ActiveOpponentPoolV6(base.ActiveOpponentPool):
+    def __init__(
+        self,
+        model_factory,
+        recent_size: int,
+        best_size: int,
+        external_checkpoints: list[tuple[str, dict]] | None = None,
+        external_prob: float = 0.0,
+    ):
+        super().__init__(model_factory=model_factory, recent_size=recent_size, best_size=best_size)
+        self.external_checkpoints = list(external_checkpoints or [])
+        self.external_prob = float(external_prob)
+
     def _load_checkpoint_opponent(self, checkpoint, agent_id: int, current_step: int):
         model = self.model_factory()
-        model.load_state_dict(checkpoint)
+        try:
+            model.load_state_dict(checkpoint)
+        except RuntimeError as exc:
+            print(f"External/self-play strict load failed; trying expanded-input load: {exc}")
+            load_state_dict_expand_input(model, checkpoint, label="opponent")
         model.to(DEVICE)
         model.eval()
         return ModelOpponentV6(model, agent_id, current_step)
@@ -547,6 +577,11 @@ class ActiveOpponentPoolV6(base.ActiveOpponentPool):
         stage = get_training_stage(current_step)
         selfplay_prob = stage["selfplay_prob"]
         can_selfplay = bool(self.recent_checkpoints or self.best_checkpoints)
+        can_external = bool(self.external_checkpoints) and self.external_prob > 0.0
+
+        if can_external and random.random() < self.external_prob:
+            _label, checkpoint = random.choice(self.external_checkpoints)
+            return self._load_checkpoint_opponent(checkpoint, agent_id, current_step)
 
         if can_selfplay and random.random() < selfplay_prob:
             source_items = []
@@ -603,6 +638,42 @@ def resolve_resume_checkpoint_path() -> Path | None:
         return None
     path = Path(explicit)
     return path if path.exists() else None
+
+
+def resolve_external_opponent_paths() -> list[Path]:
+    resolved: list[Path] = []
+    seen: set[Path] = set()
+    for raw_path in CFG.get("external_opponent_paths", []):
+        path = Path(str(raw_path).strip())
+        if not path.exists():
+            print(f"Warning: external opponent checkpoint not found, skipping: {path}")
+            continue
+        norm = path.resolve()
+        if norm in seen:
+            continue
+        seen.add(norm)
+        resolved.append(path)
+    return resolved
+
+
+def extract_model_state_dict(payload, label: str):
+    if isinstance(payload, dict) and "model" in payload:
+        return payload["model"]
+    if isinstance(payload, dict):
+        return payload
+    raise TypeError(f"{label} did not contain a state dict payload")
+
+
+def load_external_opponent_checkpoints() -> list[tuple[str, dict]]:
+    loaded: list[tuple[str, dict]] = []
+    for path in resolve_external_opponent_paths():
+        try:
+            payload = _load_checkpoint(path, map_location="cpu")
+            state_dict = extract_model_state_dict(payload, label=str(path))
+            loaded.append((path.name, state_dict))
+        except Exception as exc:
+            print(f"Warning: failed to load external opponent checkpoint {path}: {exc}")
+    return loaded
 
 
 def initial_actor_warmup_active(global_step: int, actor_initialized: bool) -> bool:
@@ -1358,10 +1429,19 @@ def train():
             )
 
     model.set_actor_trainable(actor_trainable_now(global_step, actor_initialized, stage_warmup_until))
+    external_opponent_checkpoints = load_external_opponent_checkpoints()
+    if external_opponent_checkpoints:
+        opponent_names = ", ".join(name for name, _state in external_opponent_checkpoints)
+        print(
+            f"Loaded {len(external_opponent_checkpoints)} external opponent checkpoints "
+            f"(prob {CFG['external_opponent_prob']:.2f}): {opponent_names}"
+        )
     pool = ActiveOpponentPoolV6(
         model_factory=lambda: RecurrentActorCriticV6(),
         recent_size=CFG["pool_size_recent"],
         best_size=CFG["pool_size_best"],
+        external_checkpoints=external_opponent_checkpoints,
+        external_prob=CFG["external_opponent_prob"],
     )
     buffer = SequenceRolloutBuffer(num_envs=num_envs)
     envs = [base.BomberEnv(max_steps=500) for _ in range(num_envs)]
