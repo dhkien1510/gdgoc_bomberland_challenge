@@ -27,7 +27,12 @@ BASE_AUX_DIM = 18
 ITEM_AUX_DIM = 17
 AUX_DIM = BASE_AUX_DIM + ITEM_AUX_DIM
 MASK_WARMUP_STEPS = _BASE.MASK_WARMUP_STEPS
-SAFE_BOMB_HORIZON = _BASE.SAFE_BOMB_HORIZON
+# Bumped from the v5_1 base (7) so escape search reaches further in dense-bomb /
+# high-radius positions where a real escape path can take more than 7 ticks.
+SAFE_BOMB_HORIZON = 10
+# How many ticks ahead a candidate MOVE tile must keep a viable escape route.
+# Coupled to SAFE_BOMB_HORIZON so the horizon bump also lengthens move lookahead.
+MOVE_ESCAPE_HORIZON = SAFE_BOMB_HORIZON
 VALUE_BOMB_MASK_STEPS = 1_300_000
 
 ACTION_STOP = _BASE.ACTION_STOP
@@ -466,6 +471,71 @@ def encode_aux(obs: dict, agent_id: int, bomb_state=None) -> torch.Tensor:
     return torch.from_numpy(aux)
 
 
+def _tile_has_short_escape(
+    grid: np.ndarray,
+    bomb_state: dict,
+    start_row: int,
+    start_col: int,
+    horizon: int = MOVE_ESCAPE_HORIZON,
+) -> bool:
+    """
+    Returns True if, after landing on (start_row, start_col), the agent can still
+    reach a tile that no currently-active bomb blast ever touches, within `horizon`
+    ticks, moving only through tiles that stay safe at each step.
+
+    This guards movement against walking into bomb-dense dead ends that look safe
+    on the very next tick but trap the agent a few ticks later.
+    """
+    earliest_danger = bomb_state["earliest_danger"]
+    bomb_positions = bomb_state["bomb_positions"]
+
+    # A tile no bomb can reach is already a safe refuge -> nothing to escape.
+    if earliest_danger.get((start_row, start_col)) is None:
+        return True
+
+    def safe_at(pos: tuple[int, int], step: int) -> bool:
+        danger_time = earliest_danger.get(pos)
+        return danger_time is None or danger_time > step
+
+    # Step 1 == the tick the agent lands on the candidate tile (the caller has
+    # already verified it is safe at step 1).
+    queue = deque([(1, start_row, start_col)])
+    visited = {(1, start_row, start_col)}
+
+    while queue:
+        step, cur_row, cur_col = queue.popleft()
+
+        if earliest_danger.get((cur_row, cur_col)) is None:
+            return True
+
+        if step >= horizon:
+            continue
+
+        next_step = step + 1
+        for dr, dc in ((0, 0), *ACTION_DELTAS.values()):
+            nr, nc = cur_row + dr, cur_col + dc
+            moved = (nr, nc) != (cur_row, cur_col)
+
+            if not _walkable_tile(grid, nr, nc):
+                continue
+
+            if moved:
+                occupied_until = bomb_positions.get((nr, nc))
+                if occupied_until is not None and occupied_until > next_step:
+                    continue
+
+            if not safe_at((nr, nc), next_step):
+                continue
+
+            state = (next_step, nr, nc)
+            if state in visited:
+                continue
+            visited.add(state)
+            queue.append(state)
+
+    return False
+
+
 def valid_action_mask(
     obs: dict,
     agent_id: int,
@@ -506,6 +576,12 @@ def valid_action_mask(
         if (nr, nc) in bomb_tiles:
             continue
         if not safe_at_time((nr, nc), 1):
+            continue
+        # Escape-aware movement: once the strict mask is active, reject moves that
+        # are safe next tick but offer no viable escape route a few ticks later
+        # (i.e. stepping into a bomb-dense dead end). Cheap in the common case --
+        # _tile_has_short_escape short-circuits when the tile is never in danger.
+        if strict_bomb_mask and not _tile_has_short_escape(grid, bomb_state, nr, nc):
             continue
         mask[action] = True
 

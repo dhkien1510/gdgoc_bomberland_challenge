@@ -15,6 +15,7 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 sys.modules.pop("model", None)
+sys.modules.pop("bc_model", None)
 sys.modules.pop("_model_base", None)
 sys.modules.pop("_model_v3_base", None)
 
@@ -82,8 +83,8 @@ class Agent:
         self.episode_start = True
 
         model_candidates = [
-            _HERE / "model.pth",
-            _HERE / "checkpoints/model_step1126400.pth",
+            # _HERE / "model.pth",
+            _HERE / "checkpoints/model_step1254400.pth",
         ]
         model_path = next((path for path in model_candidates if path.exists()), None)
         bc_path = _HERE / "bc_actor.pth"

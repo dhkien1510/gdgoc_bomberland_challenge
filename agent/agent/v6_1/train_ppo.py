@@ -176,6 +176,143 @@ def resolve_stage_by_name(stage_name: str):
     raise KeyError(f"Unknown curriculum stage: {stage_name}")
 
 
+def stage_best_checkpoint_path(stage_name: str) -> Path:
+    return Path(CFG["ckpt_dir"]) / f"best_stage_{stage_name}.pth"
+
+
+def make_checkpoint_payload(
+    model,
+    optimizer,
+    global_step: int,
+    stage_name: str,
+    actor_initialized: bool,
+    stage_warmup_until: int,
+    best_eval_score: float,
+    eval_stats=None,
+    phase_best_score: float | None = None,
+):
+    payload = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "global_step": int(global_step),
+        "stage": stage_name,
+        "actor_initialized": bool(actor_initialized),
+        "stage_warmup_until": int(stage_warmup_until),
+        "best_eval_score": float(best_eval_score),
+    }
+    if eval_stats is not None:
+        payload["eval"] = eval_stats
+    if phase_best_score is not None:
+        payload["phase_best_score"] = float(phase_best_score)
+    return payload
+
+
+def load_saved_stage_best_registry() -> dict[str, dict]:
+    registry: dict[str, dict] = {}
+    ckpt_dir = Path(CFG["ckpt_dir"])
+    if not ckpt_dir.exists():
+        return registry
+    for path in sorted(ckpt_dir.glob("best_stage_*.pth")):
+        try:
+            payload = _load_checkpoint(path, map_location="cpu")
+        except Exception as exc:
+            print(f"Warning: failed to inspect stage-best checkpoint {path}: {exc}")
+            continue
+        if not isinstance(payload, dict):
+            continue
+        stage_name = str(payload.get("stage", "")).strip()
+        if not stage_name:
+            suffix = path.stem.removeprefix("best_stage_")
+            stage_name = suffix
+        score = float(
+            payload.get(
+                "phase_best_score",
+                payload.get("eval", {}).get("score", payload.get("best_eval_score", float("-inf"))),
+            )
+        )
+        registry[stage_name] = {"path": path, "score": score}
+    return registry
+
+
+def reset_rollout_state(envs, pool, global_step: int, model, bc_reference_model):
+    num_envs = len(envs)
+    env_obs = []
+    env_agent_ids = []
+    env_opponents = []
+    env_alive_masks = []
+    env_death_orders = []
+    env_episode_ctxs = []
+    env_episode_starts = [True for _ in range(num_envs)]
+    for env in envs:
+        obs, agent_id, opponents, alive_mask, death_order, episode_ctx = base.start_episode(env, pool, global_step)
+        env_obs.append(obs)
+        env_agent_ids.append(agent_id)
+        env_opponents.append(opponents)
+        env_alive_masks.append(alive_mask)
+        env_death_orders.append(death_order)
+        env_episode_ctxs.append(episode_ctx)
+    actor_h, actor_c = model.get_initial_actor_state(num_envs, DEVICE)
+    bc_reference_state = None if bc_reference_model is None else bc_reference_model.get_initial_state(num_envs, DEVICE)
+    return (
+        env_obs,
+        env_agent_ids,
+        env_opponents,
+        env_alive_masks,
+        env_death_orders,
+        env_episode_ctxs,
+        env_episode_starts,
+        actor_h,
+        actor_c,
+        bc_reference_state,
+    )
+
+
+def load_phase_handoff_checkpoint(
+    stage_name: str,
+    model,
+    optimizer,
+    current_global_step: int,
+    actor_initialized: bool,
+    stage_warmup_until: int,
+    best_eval_score: float,
+    registry: dict[str, dict],
+):
+    info = registry.get(stage_name)
+    if not info:
+        return actor_initialized, stage_warmup_until, best_eval_score, False
+
+    path = info["path"]
+    payload = _load_checkpoint(path, map_location=DEVICE)
+    if not isinstance(payload, dict) or "model" not in payload:
+        print(f"Warning: invalid stage-best checkpoint payload at {path}; skipping handoff reload")
+        return actor_initialized, stage_warmup_until, best_eval_score, False
+
+    try:
+        model.load_state_dict(payload["model"])
+    except RuntimeError as exc:
+        print(f"Stage-best strict load failed; trying expanded-input load: {exc}")
+        load_state_dict_expand_input(model, payload["model"], label=f"phase_handoff:{stage_name}")
+
+    optimizer_loaded = _try_load_optimizer_state(optimizer, payload.get("optimizer"))
+    if not optimizer_loaded:
+        print(
+            f"Stage-best optimizer state for {stage_name} was incompatible; "
+            "continuing with current optimizer state"
+        )
+
+    actor_initialized = bool(payload.get("actor_initialized", actor_initialized))
+    stage_warmup_until = max(int(stage_warmup_until), current_global_step + CFG["stage_actor_warmup_steps"])
+    best_eval_score = max(
+        float(best_eval_score),
+        float(payload.get("best_eval_score", payload.get("eval", {}).get("score", float("-inf")))),
+    )
+    print(
+        f"Reloaded best checkpoint from stage {stage_name} ({path.name}) at step {current_global_step:,} | "
+        f"phase_best_score {info['score']:.3f}"
+    )
+    return actor_initialized, stage_warmup_until, best_eval_score, True
+
+
 def _load_checkpoint(path: str | Path, map_location):
     try:
         return torch.load(path, map_location=map_location, weights_only=True)
@@ -1171,6 +1308,7 @@ def train():
     best_eval_score = float("-inf")
     stage_warmup_until = 0
     last_save_step = 0
+    phase_best_registry = load_saved_stage_best_registry()
     if resume_checkpoint_path is not None:
         resume_payload = _load_checkpoint(resume_checkpoint_path, map_location=DEVICE)
         if not isinstance(resume_payload, dict) or "model" not in resume_payload:
@@ -1250,16 +1388,18 @@ def train():
     env_death_orders = []
     env_episode_ctxs = []
     env_episode_starts = [True for _ in range(num_envs)]
-    for env in envs:
-        obs, agent_id, opponents, alive_mask, death_order, episode_ctx = base.start_episode(env, pool, global_step)
-        env_obs.append(obs)
-        env_agent_ids.append(agent_id)
-        env_opponents.append(opponents)
-        env_alive_masks.append(alive_mask)
-        env_death_orders.append(death_order)
-        env_episode_ctxs.append(episode_ctx)
-    actor_h, actor_c = model.get_initial_actor_state(num_envs, DEVICE)
-    bc_reference_state = None if bc_reference_model is None else bc_reference_model.get_initial_state(num_envs, DEVICE)
+    (
+        env_obs,
+        env_agent_ids,
+        env_opponents,
+        env_alive_masks,
+        env_death_orders,
+        env_episode_ctxs,
+        env_episode_starts,
+        actor_h,
+        actor_c,
+        bc_reference_state,
+    ) = reset_rollout_state(envs, pool, global_step, model, bc_reference_model)
     actor_trainable = actor_trainable_now(global_step, actor_initialized, stage_warmup_until)
     active_stage_name = get_training_stage(global_step)["name"]
     t_start = time.time()
@@ -1326,6 +1466,40 @@ def train():
     print(f"{'=' * 60}\n")
 
     while global_step < CFG["total_steps"]:
+        stage = get_training_stage(global_step)
+        if stage["name"] != active_stage_name:
+            prev_stage_name = active_stage_name
+            active_stage_name = stage["name"]
+            actor_initialized, stage_warmup_until, best_eval_score, reloaded = load_phase_handoff_checkpoint(
+                prev_stage_name,
+                model,
+                optimizer,
+                current_global_step=global_step,
+                actor_initialized=actor_initialized,
+                stage_warmup_until=stage_warmup_until,
+                best_eval_score=best_eval_score,
+                registry=phase_best_registry,
+            )
+            if reloaded:
+                pool.add_recent_checkpoint(copy.deepcopy(model.state_dict()))
+            (
+                env_obs,
+                env_agent_ids,
+                env_opponents,
+                env_alive_masks,
+                env_death_orders,
+                env_episode_ctxs,
+                env_episode_starts,
+                actor_h,
+                actor_c,
+                bc_reference_state,
+            ) = reset_rollout_state(envs, pool, global_step, model, bc_reference_model)
+            print(
+                f"Stage changed {prev_stage_name} -> {active_stage_name} at step {global_step:,}; "
+                f"critic-only warm-up until step {stage_warmup_until:,}"
+            )
+        actor_trainable = actor_trainable_now(global_step, actor_initialized, stage_warmup_until)
+        model.set_actor_trainable(actor_trainable)
         buffer.reset()
         model.eval()
         stage = get_training_stage(global_step)
@@ -1336,16 +1510,6 @@ def train():
 
         rollout_t0 = time.time()
         for _ in range(rollout_env_steps):
-            stage = get_training_stage(global_step)
-            if stage["name"] != active_stage_name:
-                prev_stage_name = active_stage_name
-                active_stage_name = stage["name"]
-                stage_warmup_until = max(stage_warmup_until, global_step + CFG["stage_actor_warmup_steps"])
-                print(
-                    f"Stage changed {prev_stage_name} -> {active_stage_name} at step {global_step:,}; "
-                    f"critic-only warm-up until step {stage_warmup_until:,}"
-                )
-
             should_train_actor = actor_trainable_now(global_step, actor_initialized, stage_warmup_until)
             if should_train_actor != actor_trainable:
                 actor_trainable = should_train_actor
@@ -1582,15 +1746,15 @@ def train():
             ckpt_path = Path(CFG["ckpt_dir"]) / f"model_step{global_step}.pth"
             checkpoint_t0 = time.time()
             torch.save(
-                {
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "global_step": global_step,
-                    "stage": stage["name"],
-                    "actor_initialized": actor_initialized,
-                    "stage_warmup_until": stage_warmup_until,
-                    "best_eval_score": best_eval_score,
-                },
+                make_checkpoint_payload(
+                    model,
+                    optimizer,
+                    global_step=global_step,
+                    stage_name=stage["name"],
+                    actor_initialized=actor_initialized,
+                    stage_warmup_until=stage_warmup_until,
+                    best_eval_score=best_eval_score,
+                ),
                 ckpt_path,
             )
             checkpoint_time = time.time() - checkpoint_t0
@@ -1646,29 +1810,57 @@ def train():
                 best_eval_score = eval_stats["score"]
                 pool.add_best_checkpoint(model.state_dict())
                 torch.save(
-                    {
-                        "model": model.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "global_step": global_step,
-                        "stage": stage["name"],
-                        "actor_initialized": actor_initialized,
-                        "stage_warmup_until": stage_warmup_until,
-                        "best_eval_score": best_eval_score,
-                        "eval": eval_stats,
-                    },
+                    make_checkpoint_payload(
+                        model,
+                        optimizer,
+                        global_step=global_step,
+                        stage_name=stage["name"],
+                        actor_initialized=actor_initialized,
+                        stage_warmup_until=stage_warmup_until,
+                        best_eval_score=best_eval_score,
+                        eval_stats=eval_stats,
+                    ),
                     _HERE / "model.pth",
                 )
                 print(f"  -> New best v6 model! Eval score: {best_eval_score:.3f}")
 
+            stage_best = phase_best_registry.get(stage["name"])
+            stage_best_score = float(stage_best["score"]) if stage_best else float("-inf")
+            if eval_stats["score"] >= stage_best_score:
+                stage_best_path = stage_best_checkpoint_path(stage["name"])
+                torch.save(
+                    make_checkpoint_payload(
+                        model,
+                        optimizer,
+                        global_step=global_step,
+                        stage_name=stage["name"],
+                        actor_initialized=actor_initialized,
+                        stage_warmup_until=stage_warmup_until,
+                        best_eval_score=best_eval_score,
+                        eval_stats=eval_stats,
+                        phase_best_score=eval_stats["score"],
+                    ),
+                    stage_best_path,
+                )
+                phase_best_registry[stage["name"]] = {
+                    "path": stage_best_path,
+                    "score": float(eval_stats["score"]),
+                }
+                print(
+                    f"  -> New best for stage {stage['name']}: {eval_stats['score']:.3f} "
+                    f"saved to {stage_best_path}"
+                )
+
     torch.save(
-        {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "global_step": global_step,
-            "actor_initialized": actor_initialized,
-            "stage_warmup_until": stage_warmup_until,
-            "best_eval_score": best_eval_score,
-        },
+        make_checkpoint_payload(
+            model,
+            optimizer,
+            global_step=global_step,
+            stage_name=active_stage_name,
+            actor_initialized=actor_initialized,
+            stage_warmup_until=stage_warmup_until,
+            best_eval_score=best_eval_score,
+        ),
         _HERE / "model_last.pth",
     )
 

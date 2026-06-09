@@ -13,6 +13,7 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 sys.modules.pop("_model_base", None)
 sys.modules.pop("_model_v3_base", None)
+sys.modules.pop("bc_model", None)
 
 import numpy as np
 import torch
