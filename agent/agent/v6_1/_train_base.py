@@ -296,7 +296,17 @@ ITEM_REWARD_COMMON = {
     "resource_adv_bomb_coef": 0.0,
     "resource_adv_radius_coef": 0.02,
     "resource_adv_delta_clip": 0.03,
+    "duel_loop_window": 8,
+    "duel_loop_unique_max": 2,
+    "r_duel_loop_penalty": -0.035,
+    "duel_safe_item_dist": 5,
+    "r_duel_safe_item_pressure": 0.015,
+    "r_duel_item_stall": -0.015,
+    "r_duel_commit_enemy_bonus": 0.08,
 }
+
+RESOURCE_CONTROL_END_STEP = 1_500_000
+LATE_GAME_CLOSER_END_STEP = 1_650_000
 
 CURRICULUM_STAGES = [
     {
@@ -425,7 +435,7 @@ CURRICULUM_STAGES = [
     },
     {
         "name": "resource_control",
-        "end_step": RESOURCE_CONTROL_STAGE_START,
+        "end_step": RESOURCE_CONTROL_END_STEP,
         "baseline_bots": [(TacticalRuleAgent, 0.45), (GeniusRuleAgent, 0.35), (SmarterRuleAgent, 0.20)],
         "selfplay_prob": 0.20,
         "reward": {
@@ -451,6 +461,95 @@ CURRICULUM_STAGES = [
             "r_move_away_bomb_spot": -0.0005,
             "r_best_bomb_spot_dist": 0.004,
             "r_position_loop": -0.03,
+            "late_step_start": 350,
+            "ffa_reward_add": {
+                "r_kill": -0.45,
+                "r_move_closer": -0.0004,
+                "r_move_away": +0.0002,
+                "r_best_enemy_dist": -0.0030,
+                "r_danger_critical": -0.05,
+                "r_danger_soon": -0.03,
+                "r_escape_danger": +0.02,
+                "r_valuable_bomb_enemy": -0.08,
+                "r_item_collect": +0.02,
+                "r_item_capacity": +0.04,
+                "r_item_radius": +0.04,
+            },
+            "duel_reward_add": {
+                "r_kill": +0.55,
+                "r_move_closer": +0.0010,
+                "r_best_enemy_dist": +0.0050,
+                "r_valuable_bomb_enemy": +0.10,
+                "r_no_escape_bomb": +0.08,
+                "resource_adv_radius_coef": +0.03,
+                "tiebreak_item_diff_coef": -0.02,
+                "tiebreak_box_diff_coef": -0.01,
+                "tiebreak_kill_diff_coef": +0.03,
+            },
+            "late_step_reward_add": {
+                "tiebreak_box_diff_coef": +0.02,
+                "tiebreak_item_diff_coef": +0.02,
+            },
+            **ITEM_REWARD_COMMON,
+        },
+    },
+    {
+        "name": "late_game_closer",
+        "end_step": LATE_GAME_CLOSER_END_STEP,
+        "baseline_bots": [(TacticalRuleAgent, 0.40), (GeniusRuleAgent, 0.35), (SmarterRuleAgent, 0.10), (BoxFarmerAgent, 0.15)],
+        "selfplay_prob": 0.35,
+        "reward": {
+            "step_penalty": -0.01,
+            "r_death": -1.0,
+            "r_kill": 1.8,
+            "r_box_destroy": 0.035,
+            "r_item_collect": 0.10,
+            "r_bomb_place": 0.0,
+            "r_move_closer": 0.0004,
+            "r_move_away": -0.0003,
+            "r_best_enemy_dist": 0.003,
+            "r_danger_critical": -0.28,
+            "r_danger_soon": -0.12,
+            "r_danger_far": -0.03,
+            "r_escape_danger": 0.06,
+            "r_valuable_bomb_enemy": 0.22,
+            "r_valuable_bomb_box": 0.03,
+            "r_useless_bomb": -0.13,
+            "r_no_escape_bomb": -0.72,
+            "rank_rewards": {0: 2.2, 1: 0.55, 2: -0.55, 3: -2.1},
+            "r_move_closer_bomb_spot": 0.0007,
+            "r_move_away_bomb_spot": -0.0004,
+            "r_best_bomb_spot_dist": 0.003,
+            "r_position_loop": -0.035,
+            "late_step_start": 320,
+            "ffa_reward_add": {
+                "r_kill": -0.70,
+                "r_move_closer": -0.0005,
+                "r_move_away": +0.0002,
+                "r_best_enemy_dist": -0.0020,
+                "r_danger_critical": -0.05,
+                "r_danger_soon": -0.03,
+                "r_escape_danger": +0.02,
+                "r_valuable_bomb_enemy": -0.09,
+                "r_item_collect": +0.01,
+                "r_item_capacity": +0.03,
+                "r_item_radius": +0.03,
+            },
+            "duel_reward_add": {
+                "r_kill": +0.80,
+                "r_move_closer": +0.0014,
+                "r_best_enemy_dist": +0.0060,
+                "r_valuable_bomb_enemy": +0.13,
+                "r_no_escape_bomb": +0.10,
+                "resource_adv_radius_coef": +0.04,
+                "tiebreak_kill_diff_coef": +0.04,
+                "tiebreak_item_diff_coef": -0.03,
+                "tiebreak_box_diff_coef": -0.02,
+            },
+            "late_step_reward_add": {
+                "tiebreak_kill_diff_coef": +0.02,
+                "tiebreak_box_diff_coef": +0.02,
+            },
             **ITEM_REWARD_COMMON,
         },
     },
@@ -482,6 +581,34 @@ CURRICULUM_STAGES = [
             "r_move_away_bomb_spot": -0.0005,
             "r_best_bomb_spot_dist": 0.004,
             "r_position_loop": -0.03,
+            "late_step_start": 320,
+            "ffa_reward_add": {
+                "r_kill": -0.55,
+                "r_move_closer": -0.0004,
+                "r_move_away": +0.0002,
+                "r_best_enemy_dist": -0.0025,
+                "r_danger_critical": -0.04,
+                "r_danger_soon": -0.02,
+                "r_escape_danger": +0.02,
+                "r_valuable_bomb_enemy": -0.07,
+                "r_item_collect": +0.01,
+                "r_item_capacity": +0.03,
+                "r_item_radius": +0.03,
+            },
+            "duel_reward_add": {
+                "r_kill": +0.65,
+                "r_move_closer": +0.0012,
+                "r_best_enemy_dist": +0.0050,
+                "r_valuable_bomb_enemy": +0.12,
+                "r_no_escape_bomb": +0.08,
+                "resource_adv_radius_coef": +0.03,
+                "tiebreak_kill_diff_coef": +0.04,
+                "tiebreak_item_diff_coef": -0.02,
+            },
+            "late_step_reward_add": {
+                "tiebreak_kill_diff_coef": +0.02,
+                "tiebreak_box_diff_coef": +0.02,
+            },
             **ITEM_REWARD_COMMON,
         },
     },
@@ -508,6 +635,7 @@ def get_stage_by_name(stage_name: str):
     aliases = {
         "phase_resource_control": "resource_control",
         "phase_item_control_easy": "easy_item_taken",
+        "phase_late_game_closer": "late_game_closer",
         "phase4_full": "selfplay_hard",
     }
     stage_name = aliases.get(stage_name, stage_name)
@@ -548,6 +676,37 @@ def danger_penalty_value(reward_cfg: dict, current_danger: int | None) -> float:
     return 0.0
 
 
+def _apply_reward_add(base_reward_cfg: dict, reward_add: dict | None) -> dict:
+    if not reward_add:
+        return base_reward_cfg
+    merged = dict(base_reward_cfg)
+    for key, delta in reward_add.items():
+        base_value = merged.get(key)
+        if isinstance(base_value, (int, float)) and isinstance(delta, (int, float)):
+            merged[key] = float(base_value) + float(delta)
+        else:
+            merged[key] = delta
+    return merged
+
+
+def effective_reward_cfg(stage: dict, alive_count: int, current_step: int | None) -> dict:
+    reward_cfg = stage["reward"]
+    dynamic_keys = ("ffa_reward_add", "duel_reward_add", "late_step_reward_add")
+    if not any(key in reward_cfg for key in dynamic_keys):
+        return reward_cfg
+
+    effective = reward_cfg
+    if alive_count >= 3:
+        effective = _apply_reward_add(effective, reward_cfg.get("ffa_reward_add"))
+    elif alive_count == 2:
+        effective = _apply_reward_add(effective, reward_cfg.get("duel_reward_add"))
+
+    late_step_start = reward_cfg.get("late_step_start")
+    if late_step_start is not None and current_step is not None and int(current_step) >= int(late_step_start):
+        effective = _apply_reward_add(effective, reward_cfg.get("late_step_reward_add"))
+    return effective
+
+
 def is_position_loop(recent_positions: deque[tuple[int, int]]) -> bool:
     if len(recent_positions) < 8:
         return False
@@ -557,6 +716,16 @@ def is_position_loop(recent_positions: deque[tuple[int, int]]) -> bool:
     if len(set(last[-8:])) == 2:
         return True
     return False
+
+
+def is_duel_stalemate(episode_ctx: dict, reward_cfg: dict) -> bool:
+    window = int(reward_cfg.get("duel_loop_window", 8))
+    unique_max = int(reward_cfg.get("duel_loop_unique_max", 2))
+    recent_positions = episode_ctx.get("recent_positions")
+    if recent_positions is None or len(recent_positions) < window:
+        return False
+    tail = list(recent_positions)[-window:]
+    return len(set(tail)) <= unique_max
 
 
 def alive_agent_ids(obs: dict) -> list[int]:
@@ -794,6 +963,9 @@ def make_episode_context(obs: dict, agent_id: int) -> dict:
         "near_item_ignored": 0,
         "item_progress_events": 0,
         "item_progress_reward_total": 0.0,
+        "duel_stall_steps": 0,
+        "duel_item_stall_events": 0,
+        "duel_commit_bomb_events": 0,
         "visited_tiles": {(start_row, start_col)},
         "repeat_steps": 0,
         "recent_positions": recent_positions,
@@ -821,6 +993,9 @@ def summarize_episode_metrics(episode_ctx: dict, final_stats: dict) -> dict:
             "boxes_per_bomb": float(final_stats.get("boxes", 0)) / bombs,
             "item_progress_events": float(episode_ctx.get("item_progress_events", 0)),
             "item_progress_reward_total": float(episode_ctx.get("item_progress_reward_total", 0.0)),
+            "duel_stall_steps": float(episode_ctx.get("duel_stall_steps", 0)),
+            "duel_item_stall_events": float(episode_ctx.get("duel_item_stall_events", 0)),
+            "duel_commit_bomb_events": float(episode_ctx.get("duel_commit_bomb_events", 0)),
         }
     )
     return metrics
@@ -841,7 +1016,8 @@ def compute_reward(
     all_curr_stats: list[dict] | None = None,
     current_step: int | None = None,
 ):
-    reward_cfg = stage["reward"]
+    alive_count = len(alive_agent_ids(obs))
+    reward_cfg = effective_reward_cfg(stage, alive_count, current_step)
     reward = reward_cfg["step_penalty"]
 
     was_alive = bool(prev_obs["players"][agent_id][2])
@@ -864,6 +1040,9 @@ def compute_reward(
         elif enemy_hit:
             reward += reward_cfg["r_valuable_bomb_enemy"]
             episode_ctx["valuable_bombs"] += bombs_placed
+            if alive_count == 2:
+                reward += reward_cfg.get("r_duel_commit_enemy_bonus", 0.0)
+                episode_ctx["duel_commit_bomb_events"] += bombs_placed
         elif boxes_hit > 0:
             reward += reward_cfg["r_valuable_bomb_box"] * min(boxes_hit, 2)
             episode_ctx["box_bombs"] += bombs_placed
@@ -1017,7 +1196,6 @@ def compute_reward(
             else:
                 reward += reward_cfg["r_destroy_item_other"]
 
-        alive_count = len(alive_agent_ids(obs))
         if (
             (current_step is not None and current_step >= reward_cfg["tiebreak_start_step"])
             or alive_count <= 2
@@ -1034,6 +1212,24 @@ def compute_reward(
                 )
 
         if alive_count == 2:
+            if curr_danger is None and is_duel_stalemate(episode_ctx, reward_cfg):
+                reward += reward_cfg.get("r_duel_loop_penalty", 0.0)
+                episode_ctx["duel_stall_steps"] += 1
+
+            if safe_for_item and prev_item_info is not None:
+                prev_item_dist = int(prev_item_info["dist"])
+                duel_item_dist_limit = int(
+                    reward_cfg.get("duel_safe_item_dist", reward_cfg["item_priority_dist"])
+                )
+                if prev_item_dist <= duel_item_dist_limit:
+                    curr_item_dist = None if curr_item_info is None else int(curr_item_info["dist"])
+                    if item_delta <= 0:
+                        if curr_item_dist is not None and curr_item_dist < prev_item_dist:
+                            reward += reward_cfg.get("r_duel_safe_item_pressure", 0.0)
+                        elif curr_item_dist is None or curr_item_dist >= prev_item_dist:
+                            reward += reward_cfg.get("r_duel_item_stall", 0.0)
+                            episode_ctx["duel_item_stall_events"] += 1
+
             prev_resource_adv = resource_advantage(prev_obs, agent_id, reward_cfg)
             curr_resource_adv = resource_advantage(obs, agent_id, reward_cfg)
             if prev_resource_adv is not None and curr_resource_adv is not None:
@@ -1095,6 +1291,7 @@ __all__ = [
     "has_clear_kill_opportunity",
     "has_escape_after_placing_bomb",
     "infer_picked_item_type",
+    "is_duel_stalemate",
     "mask_eval_mode",
     "nearest_safe_item_dist",
     "nearest_enemy_distance",
