@@ -40,6 +40,7 @@ from smarter_rule_agent import SmarterRuleAgent
 from tactical_rule_agent import TacticalRuleAgent
 from engine.game import BomberEnv
 import _train_base as base
+from v6_submission_agent import V6SubmissionAgent
 
 ACTION_PLACE_BOMB = _MODEL.ACTION_PLACE_BOMB
 MASK_WARMUP_STEPS = _MODEL.MASK_WARMUP_STEPS
@@ -66,7 +67,7 @@ class PPOAgentEval:
         agent_id: int,
         current_step: int = VALUE_BOMB_MASK_STEPS,
         deterministic: bool = True,
-    ):
+    ):  
         self.agent_id = int(agent_id)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.current_step = int(current_step)
@@ -151,15 +152,28 @@ class PPOAgentEval:
         }
 
 
-def opponent_pool(name: str):
+def opponent_pool(name: str, suite_name: str = "legacy"):
     if name == "easy":
-        return [RandomAgent, SimpleRuleAgent, BoxFarmerAgent]
+        return [SimpleRuleAgent, SmarterRuleAgent, BoxFarmerAgent]
     if name == "hard":
-        return [SmarterRuleAgent, GeniusRuleAgent, TacticalRuleAgent]
-    return [RandomAgent, SimpleRuleAgent, BoxFarmerAgent, SmarterRuleAgent, GeniusRuleAgent, TacticalRuleAgent]
+        if suite_name == "v6hard":
+            return [V6SubmissionAgent, TacticalRuleAgent]
+        return [GeniusRuleAgent, TacticalRuleAgent]
+    if name == "mixed":
+        if suite_name == "v6hard":
+            return [SimpleRuleAgent, SmarterRuleAgent, BoxFarmerAgent, V6SubmissionAgent, TacticalRuleAgent]
+        return [SimpleRuleAgent, SmarterRuleAgent, BoxFarmerAgent, GeniusRuleAgent, TacticalRuleAgent]
+    return [RandomAgent, SimpleRuleAgent, BoxFarmerAgent, SmarterRuleAgent, TacticalRuleAgent]
 
-
-def run_match(checkpoint_path: str, pool_name: str, num_matches: int, seed_base: int, stage_name: str):
+def run_match(
+    checkpoint_path: str,
+    pool_name: str,
+    num_matches: int,
+    seed_base: int,
+    stage_name: str,
+    seed_offset: int = 0,
+    suite_name: str = "legacy",
+):
     total_points = 0.0
     total_first = 0.0
     total_unique_first = 0.0
@@ -176,14 +190,15 @@ def run_match(checkpoint_path: str, pool_name: str, num_matches: int, seed_base:
     total_revisit = 0.0
     total_loop_break = 0.0
     total_vb = 0.0
-    opponents_pool = opponent_pool(pool_name)
+    opponents_pool = opponent_pool(pool_name, suite_name=suite_name)
     reward_stage = base.get_stage_by_name(stage_name)
 
+    suite_rng = random.Random(seed_base + seed_offset)
     for match_idx in range(num_matches):
-        seed = seed_base + match_idx
+        seed = seed_base + seed_offset + match_idx
         rng = random.Random(seed)
         env = BomberEnv(max_steps=500, seed=seed)
-        agent_id = rng.randrange(4)
+        agent_id = suite_rng.randrange(4)
         obs = env.reset(seed=seed)
 
         learner = PPOAgentEval(checkpoint_path, agent_id)
@@ -253,23 +268,89 @@ def run_match(checkpoint_path: str, pool_name: str, num_matches: int, seed_base:
         total_vb += metrics["valuable_bomb_ratio"]
 
     denom = max(num_matches, 1)
+    return {
+        "matches": int(num_matches),
+        "avg_points": total_points / denom,
+        "avg_rank": total_rank / denom,
+        "first_rate": total_first / denom,
+        "unique_first_rate": total_unique_first / denom,
+        "shared_first_rate": total_shared_first / denom,
+        "bombs": total_bombs / denom,
+        "boxes": total_boxes / denom,
+        "items": total_items / denom,
+        "kills": total_kills / denom,
+        "valuable_bomb_ratio": total_vb / denom,
+        "no_escape_bomb_ratio": total_no_escape / denom,
+        "danger_steps": total_danger / denom,
+        "tiles": total_tiles / denom,
+        "repeat_position_rate": total_repeat / denom,
+        "revisit_rate": total_revisit / denom,
+        "loop_break_rate": total_loop_break / denom,
+    }
+
+
+def print_pool_summary(label: str, stats: dict):
     print(
-        f"Pool {pool_name} | points {total_points / denom:.3f} | first {total_first / denom:.2%} "
-        f"(unique {total_unique_first / denom:.2%}, shared {total_shared_first / denom:.2%}) | "
-        f"rank {total_rank / denom:.2f} | bombs {total_bombs / denom:.2f} | "
-        f"boxes {total_boxes / denom:.2f} | items {total_items / denom:.2f} | "
-        f"kills {total_kills / denom:.2f} | vb {total_vb / denom:.2%} | "
-        f"no_escape {total_no_escape / denom:.2%} | danger {total_danger / denom:.1f} | "
-        f"tiles {total_tiles / denom:.1f} | repeat {total_repeat / denom:.2%} | "
-        f"revisit {total_revisit / denom:.2%} | loop_break {total_loop_break / denom:.2%}"
+        f"Pool {label} | points {stats['avg_points']:.3f} | first {stats['first_rate']:.2%} "
+        f"(unique {stats['unique_first_rate']:.2%}, shared {stats['shared_first_rate']:.2%}) | "
+        f"rank {stats['avg_rank']:.2f} | bombs {stats['bombs']:.2f} | "
+        f"boxes {stats['boxes']:.2f} | items {stats['items']:.2f} | "
+        f"kills {stats['kills']:.2f} | vb {stats['valuable_bomb_ratio']:.2%} | "
+        f"no_escape {stats['no_escape_bomb_ratio']:.2%} | danger {stats['danger_steps']:.1f} | "
+        f"tiles {stats['tiles']:.1f} | repeat {stats['repeat_position_rate']:.2%} | "
+        f"revisit {stats['revisit_rate']:.2%} | loop_break {stats['loop_break_rate']:.2%}"
     )
+
+
+def run_suite(
+    checkpoint_path: str,
+    easy_matches: int,
+    hard_matches: int,
+    seed_base: int,
+    stage_name: str,
+    suite_name: str = "legacy",
+):
+    easy = run_match(
+        checkpoint_path=checkpoint_path,
+        pool_name="easy",
+        num_matches=easy_matches,
+        seed_base=seed_base,
+        stage_name=stage_name,
+        seed_offset=0,
+        suite_name=suite_name,
+    )
+    hard = run_match(
+        checkpoint_path=checkpoint_path,
+        pool_name="hard",
+        num_matches=hard_matches,
+        seed_base=seed_base,
+        stage_name=stage_name,
+        seed_offset=10_000,
+        suite_name=suite_name,
+    )
+    total_matches = max(easy["matches"] + hard["matches"], 1)
+    total_points = easy["avg_points"] * easy["matches"] + hard["avg_points"] * hard["matches"]
+    total_rank = easy["avg_rank"] * easy["matches"] + hard["avg_rank"] * hard["matches"]
+    total_first = easy["first_rate"] * easy["matches"] + hard["first_rate"] * hard["matches"]
+    total_unique_first = easy["unique_first_rate"] * easy["matches"] + hard["unique_first_rate"] * hard["matches"]
+    total_shared_first = easy["shared_first_rate"] * easy["matches"] + hard["shared_first_rate"] * hard["matches"]
+    print(
+        f"Eval suite ({suite_name}) | score {total_points / total_matches:.3f} | AvgRank {total_rank / total_matches:.2f} | "
+        f"First {total_first / total_matches:.2%} | UF {total_unique_first / total_matches:.2%} | "
+        f"SF {total_shared_first / total_matches:.2%}"
+    )
+    print_pool_summary("easy", easy)
+    print_pool_summary("hard", hard)
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--pool", choices=["easy", "hard", "mixed"], default="mixed")
+    parser.add_argument("--pool", choices=["easy", "hard", "mixed", "suite"], default="suite")
+    parser.add_argument("--suite", choices=["legacy", "v6hard"], default="legacy")
     parser.add_argument("--num_matches", type=int, default=20)
+    parser.add_argument("--easy_matches", type=int, default=50)
+    parser.add_argument("--hard_matches", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--stage_name",
@@ -289,4 +370,22 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    run_match(args.checkpoint, args.pool, args.num_matches, args.seed, args.stage_name)
+    if args.pool == "suite":
+        run_suite(
+            checkpoint_path=args.checkpoint,
+            easy_matches=args.easy_matches,
+            hard_matches=args.hard_matches,
+            seed_base=args.seed,
+            stage_name=args.stage_name,
+            suite_name=args.suite,
+        )
+    else:
+        stats = run_match(
+            args.checkpoint,
+            args.pool,
+            args.num_matches,
+            args.seed,
+            args.stage_name,
+            suite_name=args.suite,
+        )
+        print_pool_summary(args.pool, stats)

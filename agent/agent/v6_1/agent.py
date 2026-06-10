@@ -83,8 +83,9 @@ class Agent:
         self.episode_start = True
 
         model_candidates = [
-            # _HERE / "model.pth",
-            _HERE / "checkpoints/model_step1254400.pth",
+            _HERE / "runtime_local/model.pth",
+            _HERE / "checkpoint_bank/submission_latest/model_step1356800.pth",
+            _HERE / "checkpoint_bank/leaderboard_best/model_step1331200.pth",
         ]
         model_path = next((path for path in model_candidates if path.exists()), None)
         bc_path = _HERE / "bc_actor.pth"
