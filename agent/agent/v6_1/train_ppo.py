@@ -914,6 +914,8 @@ def _run_eval_match_impl(model, device, opponent_classes, seed: int, agent_id: i
             "safe_item_opportunities": episode_metrics.get("safe_item_opportunities", 0.0),
             "safe_item_take_rate": episode_metrics.get("safe_item_take_rate", 0.0),
             "near_item_ignore_rate": episode_metrics.get("near_item_ignore_rate", 0.0),
+            "survived_to_top3": episode_metrics.get("survived_to_top3", 0.0),
+            "survived_to_top2": episode_metrics.get("survived_to_top2", 0.0),
             "items_per_box": episode_metrics.get("items_per_box", 0.0),
             "boxes_per_bomb": episode_metrics.get("boxes_per_bomb", 0.0),
             "our_bombs": float(our_player.stats["bombs"]),
@@ -1000,6 +1002,8 @@ def _aggregate_eval_results(results, num_matches: int):
         "safe_item_opportunities": 0.0,
         "safe_item_take_rate": 0.0,
         "near_item_ignore_rate": 0.0,
+        "survived_to_top3": 0.0,
+        "survived_to_top2": 0.0,
         "items_per_box": 0.0,
         "boxes_per_bomb": 0.0,
         "our_bombs": 0.0,
@@ -1053,6 +1057,8 @@ def _aggregate_eval_results(results, num_matches: int):
         "safe_item_opportunities": totals["safe_item_opportunities"] / denom,
         "safe_item_take_rate": totals["safe_item_take_rate"] / denom,
         "near_item_ignore_rate": totals["near_item_ignore_rate"] / denom,
+        "survived_to_top3": totals["survived_to_top3"] / denom,
+        "survived_to_top2": totals["survived_to_top2"] / denom,
         "items_per_box": totals["items_per_box"] / denom,
         "boxes_per_bomb": totals["boxes_per_bomb"] / denom,
         "total_points": totals["points"],
@@ -1202,6 +1208,8 @@ def evaluate_policy(model, current_step: int):
         "safe_item_opportunities",
         "safe_item_take_rate",
         "near_item_ignore_rate",
+        "survived_to_top3",
+        "survived_to_top2",
         "items_per_box",
         "boxes_per_bomb",
     ]
@@ -1486,6 +1494,8 @@ def train():
     items_per_box_history = deque(maxlen=100)
     boxes_per_bomb_history = deque(maxlen=100)
     safe_item_opportunities_history = deque(maxlen=100)
+    top3_survival_history = deque(maxlen=100)
+    top2_survival_history = deque(maxlen=100)
 
     env_obs = []
     env_agent_ids = []
@@ -1554,7 +1564,8 @@ def train():
             f"{eval_stats['timeout_loss_by_bombs']:.2%}"
         )
         print(
-            f"  ItemOpp {eval_stats['safe_item_opportunities']:.1f} | "
+            f"  Top3 {eval_stats['survived_to_top3']:.2%} | Top2 {eval_stats['survived_to_top2']:.2%} | "
+            f"ItemOpp {eval_stats['safe_item_opportunities']:.1f} | "
             f"Take {eval_stats['safe_item_take_rate']:.2%} | "
             f"Ignore {eval_stats['near_item_ignore_rate']:.2%} | "
             f"I/Box {eval_stats['items_per_box']:.2f} | "
@@ -1751,6 +1762,8 @@ def train():
                     items_per_box_history.append(episode_metrics.get("items_per_box", 0.0))
                     boxes_per_bomb_history.append(episode_metrics.get("boxes_per_bomb", 0.0))
                     safe_item_opportunities_history.append(episode_metrics.get("safe_item_opportunities", 0.0))
+                    top3_survival_history.append(episode_metrics.get("survived_to_top3", 0.0))
+                    top2_survival_history.append(episode_metrics.get("survived_to_top2", 0.0))
 
                     (
                         env_obs[env_idx],
@@ -1828,6 +1841,8 @@ def train():
         safe_item_opportunities = (
             np.mean(safe_item_opportunities_history) if safe_item_opportunities_history else 0.0
         )
+        top3_survival_rate = np.mean(top3_survival_history) if top3_survival_history else 0.0
+        top2_survival_rate = np.mean(top2_survival_history) if top2_survival_history else 0.0
         elapsed = time.time() - t_start
         sps = global_step / max(elapsed, 1.0)
 
@@ -1837,6 +1852,7 @@ def train():
             f"Bombs {bombs_per_episode:.2f} | VB {valuable_bomb_ratio:.2%} | UB {useless_bomb_ratio:.2%} | "
             f"NEB {no_escape_bomb_ratio:.2%} | Danger {danger_steps_per_episode:.1f} | "
             f"Tiles {unique_tiles_visited:.1f} | Repeat {repeat_position_rate:.2%} | "
+            f"Top3 {top3_survival_rate:.2%} | Top2 {top2_survival_rate:.2%} | "
             f"ItemOpp {safe_item_opportunities:.1f} | ItemTake {safe_item_take_rate:.2%} | "
             f"ItemIgn {near_item_ignore_rate:.2%} | I/Box {items_per_box:.2f} | "
             f"B/Bo {boxes_per_bomb:.2f} | "
@@ -1901,7 +1917,8 @@ def train():
                 f"{eval_stats['timeout_loss_by_bombs']:.2%}"
             )
             print(
-                f"     ItemOpp {eval_stats['safe_item_opportunities']:.1f} | "
+                f"     Top3 {eval_stats['survived_to_top3']:.2%} | Top2 {eval_stats['survived_to_top2']:.2%} | "
+                f"ItemOpp {eval_stats['safe_item_opportunities']:.1f} | "
                 f"Take {eval_stats['safe_item_take_rate']:.2%} | "
                 f"Ignore {eval_stats['near_item_ignore_rate']:.2%} | "
                 f"I/Box {eval_stats['items_per_box']:.2f} | "

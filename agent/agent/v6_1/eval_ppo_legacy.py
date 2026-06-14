@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+import copy
 import importlib.util
+import multiprocessing as mp
 import random
 import sys
 from pathlib import Path
@@ -52,6 +54,21 @@ nearest_valuable_bomb_spot_info = _MODEL.nearest_valuable_bomb_spot_info
 prepare_policy_inputs = _MODEL.prepare_policy_inputs
 to_env_action = _MODEL.to_env_action
 
+OPPONENT_CLASS_REGISTRY = {
+    "RandomAgent": RandomAgent,
+    "SimpleRuleAgent": SimpleRuleAgent,
+    "SmarterRuleAgent": SmarterRuleAgent,
+    "BoxFarmerAgent": BoxFarmerAgent,
+    "GeniusRuleAgent": GeniusRuleAgent,
+    "TacticalRuleAgent": TacticalRuleAgent,
+    "V6SubmissionAgent": V6SubmissionAgent,
+}
+
+_EVAL_WORKER_MODEL = None
+_EVAL_WORKER_DEVICE = None
+_EVAL_WORKER_STAGE = None
+_EVAL_WORKER_OPPONENT_CLASSES = None
+
 
 def _load_checkpoint(path: str | Path, map_location):
     try:
@@ -63,24 +80,29 @@ def _load_checkpoint(path: str | Path, map_location):
 class PPOAgentEval:
     def __init__(
         self,
-        checkpoint_path: str | Path,
+        checkpoint_path: str | Path | None,
         agent_id: int,
         current_step: int = VALUE_BOMB_MASK_STEPS,
         deterministic: bool = True,
-    ):  
+        model=None,
+        device=None,
+    ):
         self.agent_id = int(agent_id)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.current_step = int(current_step)
         self.recent_positions = deque(maxlen=12)
         self.recent_actions = deque(maxlen=12)
         self.local_loop_steps = 0
         self.loop_breaker_triggers = 0
-        self.model = RecurrentActorCriticV6()
-        checkpoint = _load_checkpoint(checkpoint_path, map_location=self.device)
-        state_dict = checkpoint.get("model", checkpoint) if isinstance(checkpoint, dict) else checkpoint
-        self.model.load_state_dict(state_dict)
-        self.model.to(self.device)
-        self.model.eval()
+        if model is None:
+            self.model = RecurrentActorCriticV6()
+            checkpoint = _load_checkpoint(checkpoint_path, map_location=self.device)
+            state_dict = checkpoint.get("model", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+            self.model.load_state_dict(state_dict)
+            self.model.to(self.device)
+            self.model.eval()
+        else:
+            self.model = model
         self.state = self.model.get_initial_actor_state(1, self.device)
         self.episode_start = True
         self.deterministic = bool(deterministic)
@@ -165,15 +187,105 @@ def opponent_pool(name: str, suite_name: str = "legacy"):
         return [SimpleRuleAgent, SmarterRuleAgent, BoxFarmerAgent, GeniusRuleAgent, TacticalRuleAgent]
     return [RandomAgent, SimpleRuleAgent, BoxFarmerAgent, SmarterRuleAgent, TacticalRuleAgent]
 
-def run_match(
-    checkpoint_path: str,
-    pool_name: str,
-    num_matches: int,
-    seed_base: int,
-    stage_name: str,
-    seed_offset: int = 0,
-    suite_name: str = "legacy",
-):
+
+def _load_eval_model(checkpoint_path: str | Path, device):
+    model = RecurrentActorCriticV6()
+    checkpoint = _load_checkpoint(checkpoint_path, map_location=device)
+    state_dict = checkpoint.get("model", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    model.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
+    return model
+
+
+def _model_state_dict_cpu(checkpoint_path: str | Path):
+    checkpoint = _load_checkpoint(checkpoint_path, map_location="cpu")
+    state_dict = checkpoint.get("model", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    return {
+        key: value.detach().cpu() if torch.is_tensor(value) else value
+        for key, value in state_dict.items()
+    }
+
+
+def _run_match_once(model, device, opponent_classes, seed: int, agent_id: int, reward_stage):
+    rng = random.Random(seed)
+    env = BomberEnv(max_steps=500, seed=seed)
+    obs = env.reset(seed=seed)
+
+    learner = PPOAgentEval(
+        checkpoint_path=None,
+        agent_id=agent_id,
+        model=model,
+        device=device,
+    )
+    opponents = {
+        player_id: rng.choice(opponent_classes)(player_id)
+        for player_id in range(4)
+        if player_id != agent_id
+    }
+    alive_mask = [bool(player.alive) for player in env.players]
+    death_order = []
+    episode_ctx = base.make_episode_context(obs, agent_id)
+
+    done = False
+    while not done:
+        actions = [0] * 4
+        if env.players[agent_id].alive:
+            actions[agent_id] = learner.act(obs)
+        for opponent_id, opponent in opponents.items():
+            if env.players[opponent_id].alive:
+                actions[opponent_id] = int(opponent.act(obs))
+
+        prev_obs = base.clone_obs(obs)
+        prev_stats = base.clone_stats(env.players[agent_id])
+        prev_all_stats = [base.clone_stats(player) for player in env.players]
+        obs, terminated, truncated = env.step(actions)
+        done = terminated or truncated
+        base.record_deaths(env.players, alive_mask, death_order)
+        curr_stats = base.clone_stats(env.players[agent_id])
+        curr_all_stats = [base.clone_stats(player) for player in env.players]
+        base.compute_reward(
+            prev_obs,
+            obs,
+            prev_stats,
+            curr_stats,
+            agent_id,
+            done,
+            None,
+            episode_ctx,
+            reward_stage,
+            canonical_action=None,
+            all_prev_stats=prev_all_stats,
+            all_curr_stats=curr_all_stats,
+            current_step=env.current_step,
+        )
+
+    ranks = base.compute_competition_ranks(env.players, death_order, alive_mask)
+    first_group_size = sum(1 for rank in ranks if rank == 0)
+    final_stats = base.clone_stats(env.players[agent_id])
+    metrics = base.summarize_episode_metrics(episode_ctx, final_stats)
+    eval_metrics = learner.summarize_eval_metrics()
+    return {
+        "points": base.RANK_TO_POINTS[ranks[agent_id]],
+        "first": float(ranks[agent_id] == 0),
+        "unique_first": float(ranks[agent_id] == 0 and first_group_size == 1),
+        "shared_first": float(ranks[agent_id] == 0 and first_group_size > 1),
+        "rank": float(ranks[agent_id]),
+        "bombs": metrics["bombs_per_episode"],
+        "boxes": metrics["boxes_per_episode"],
+        "items": metrics["items_per_episode"],
+        "kills": metrics["kills_per_episode"],
+        "danger_steps": metrics["danger_steps_per_episode"],
+        "no_escape_bomb_ratio": metrics["no_escape_bomb_ratio"],
+        "tiles": metrics["unique_tiles_visited"],
+        "repeat_position_rate": eval_metrics["repeat_position_rate"],
+        "revisit_rate": metrics["repeat_position_rate"],
+        "loop_break_rate": eval_metrics["loop_breaker_rate"],
+        "valuable_bomb_ratio": metrics["valuable_bomb_ratio"],
+    }
+
+
+def _aggregate_match_results(results, num_matches: int):
     total_points = 0.0
     total_first = 0.0
     total_unique_first = 0.0
@@ -190,82 +302,24 @@ def run_match(
     total_revisit = 0.0
     total_loop_break = 0.0
     total_vb = 0.0
-    opponents_pool = opponent_pool(pool_name, suite_name=suite_name)
-    reward_stage = base.get_stage_by_name(stage_name)
 
-    suite_rng = random.Random(seed_base + seed_offset)
-    for match_idx in range(num_matches):
-        seed = seed_base + seed_offset + match_idx
-        rng = random.Random(seed)
-        env = BomberEnv(max_steps=500, seed=seed)
-        agent_id = suite_rng.randrange(4)
-        obs = env.reset(seed=seed)
-
-        learner = PPOAgentEval(checkpoint_path, agent_id)
-        opponents = {
-            player_id: rng.choice(opponents_pool)(player_id)
-            for player_id in range(4)
-            if player_id != agent_id
-        }
-        alive_mask = [bool(player.alive) for player in env.players]
-        death_order = []
-        episode_ctx = base.make_episode_context(obs, agent_id)
-
-        done = False
-        while not done:
-            actions = [0] * 4
-            if env.players[agent_id].alive:
-                actions[agent_id] = learner.act(obs)
-            for opponent_id, opponent in opponents.items():
-                if env.players[opponent_id].alive:
-                    actions[opponent_id] = int(opponent.act(obs))
-
-            prev_obs = base.clone_obs(obs)
-            prev_stats = base.clone_stats(env.players[agent_id])
-            prev_all_stats = [base.clone_stats(player) for player in env.players]
-            obs, terminated, truncated = env.step(actions)
-            done = terminated or truncated
-            base.record_deaths(env.players, alive_mask, death_order)
-            curr_stats = base.clone_stats(env.players[agent_id])
-            curr_all_stats = [base.clone_stats(player) for player in env.players]
-            base.compute_reward(
-                prev_obs,
-                obs,
-                prev_stats,
-                curr_stats,
-                agent_id,
-                done,
-                None,
-                episode_ctx,
-                reward_stage,
-                canonical_action=None,
-                all_prev_stats=prev_all_stats,
-                all_curr_stats=curr_all_stats,
-                current_step=env.current_step,
-            )
-
-        ranks = base.compute_competition_ranks(env.players, death_order, alive_mask)
-        first_group_size = sum(1 for rank in ranks if rank == 0)
-        final_stats = base.clone_stats(env.players[agent_id])
-        metrics = base.summarize_episode_metrics(episode_ctx, final_stats)
-        eval_metrics = learner.summarize_eval_metrics()
-
-        total_points += base.RANK_TO_POINTS[ranks[agent_id]]
-        total_first += float(ranks[agent_id] == 0)
-        total_unique_first += float(ranks[agent_id] == 0 and first_group_size == 1)
-        total_shared_first += float(ranks[agent_id] == 0 and first_group_size > 1)
-        total_rank += float(ranks[agent_id])
-        total_bombs += metrics["bombs_per_episode"]
-        total_boxes += metrics["boxes_per_episode"]
-        total_items += metrics["items_per_episode"]
-        total_kills += metrics["kills_per_episode"]
-        total_danger += metrics["danger_steps_per_episode"]
-        total_no_escape += metrics["no_escape_bomb_ratio"]
-        total_tiles += metrics["unique_tiles_visited"]
-        total_repeat += eval_metrics["repeat_position_rate"]
-        total_revisit += metrics["repeat_position_rate"]
-        total_loop_break += eval_metrics["loop_breaker_rate"]
-        total_vb += metrics["valuable_bomb_ratio"]
+    for result in results:
+        total_points += result["points"]
+        total_first += result["first"]
+        total_unique_first += result["unique_first"]
+        total_shared_first += result["shared_first"]
+        total_rank += result["rank"]
+        total_bombs += result["bombs"]
+        total_boxes += result["boxes"]
+        total_items += result["items"]
+        total_kills += result["kills"]
+        total_danger += result["danger_steps"]
+        total_no_escape += result["no_escape_bomb_ratio"]
+        total_tiles += result["tiles"]
+        total_repeat += result["repeat_position_rate"]
+        total_revisit += result["revisit_rate"]
+        total_loop_break += result["loop_break_rate"]
+        total_vb += result["valuable_bomb_ratio"]
 
     denom = max(num_matches, 1)
     return {
@@ -289,6 +343,82 @@ def run_match(
     }
 
 
+def _eval_worker_init(model_state_dict, stage_payload, opponent_class_names):
+    global _EVAL_WORKER_MODEL, _EVAL_WORKER_DEVICE, _EVAL_WORKER_STAGE, _EVAL_WORKER_OPPONENT_CLASSES
+    _EVAL_WORKER_DEVICE = torch.device("cpu")
+    _EVAL_WORKER_MODEL = RecurrentActorCriticV6()
+    _EVAL_WORKER_MODEL.load_state_dict(model_state_dict)
+    _EVAL_WORKER_MODEL.to(_EVAL_WORKER_DEVICE)
+    _EVAL_WORKER_MODEL.eval()
+    _EVAL_WORKER_STAGE = copy.deepcopy(stage_payload)
+    _EVAL_WORKER_OPPONENT_CLASSES = [OPPONENT_CLASS_REGISTRY[name] for name in opponent_class_names]
+
+
+def _eval_worker_run(task):
+    seed, agent_id = task
+    return _run_match_once(
+        _EVAL_WORKER_MODEL,
+        _EVAL_WORKER_DEVICE,
+        _EVAL_WORKER_OPPONENT_CLASSES,
+        seed=int(seed),
+        agent_id=int(agent_id),
+        reward_stage=_EVAL_WORKER_STAGE,
+    )
+
+def run_match(
+    checkpoint_path: str,
+    pool_name: str,
+    num_matches: int,
+    seed_base: int,
+    stage_name: str,
+    seed_offset: int = 0,
+    suite_name: str = "legacy",
+    eval_workers: int = 1,
+    shared_model=None,
+    shared_device=None,
+):
+    opponents_pool = opponent_pool(pool_name, suite_name=suite_name)
+    reward_stage = base.get_stage_by_name(stage_name)
+    suite_rng = random.Random(seed_base + seed_offset)
+    tasks = [
+        (seed_base + seed_offset + match_idx, suite_rng.randrange(4))
+        for match_idx in range(num_matches)
+    ]
+    worker_count = min(max(int(eval_workers), 1), max(num_matches, 1))
+    use_parallel = worker_count > 1 and num_matches > 1
+
+    if use_parallel:
+        model_state_cpu = _model_state_dict_cpu(checkpoint_path)
+        opponent_class_names = [cls.__name__ for cls in opponents_pool]
+        stage_payload = copy.deepcopy(reward_stage)
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(
+            processes=worker_count,
+            initializer=_eval_worker_init,
+            initargs=(model_state_cpu, stage_payload, opponent_class_names),
+        ) as pool:
+            results = pool.map(_eval_worker_run, tasks)
+    else:
+        model = shared_model
+        device = shared_device
+        if model is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            model = _load_eval_model(checkpoint_path, device)
+        results = [
+            _run_match_once(
+                model,
+                device,
+                opponents_pool,
+                seed=seed,
+                agent_id=agent_id,
+                reward_stage=reward_stage,
+            )
+            for seed, agent_id in tasks
+        ]
+
+    return _aggregate_match_results(results, num_matches)
+
+
 def print_pool_summary(label: str, stats: dict):
     print(
         f"Pool {label} | points {stats['avg_points']:.3f} | first {stats['first_rate']:.2%} "
@@ -309,7 +439,13 @@ def run_suite(
     seed_base: int,
     stage_name: str,
     suite_name: str = "legacy",
+    eval_workers: int = 1,
 ):
+    shared_model = None
+    shared_device = None
+    if int(eval_workers) <= 1:
+        shared_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        shared_model = _load_eval_model(checkpoint_path, shared_device)
     easy = run_match(
         checkpoint_path=checkpoint_path,
         pool_name="easy",
@@ -318,6 +454,9 @@ def run_suite(
         stage_name=stage_name,
         seed_offset=0,
         suite_name=suite_name,
+        eval_workers=eval_workers,
+        shared_model=shared_model,
+        shared_device=shared_device,
     )
     hard = run_match(
         checkpoint_path=checkpoint_path,
@@ -327,6 +466,9 @@ def run_suite(
         stage_name=stage_name,
         seed_offset=10_000,
         suite_name=suite_name,
+        eval_workers=eval_workers,
+        shared_model=shared_model,
+        shared_device=shared_device,
     )
     total_matches = max(easy["matches"] + hard["matches"], 1)
     total_points = easy["avg_points"] * easy["matches"] + hard["avg_points"] * hard["matches"]
@@ -351,6 +493,7 @@ def parse_args():
     parser.add_argument("--num_matches", type=int, default=20)
     parser.add_argument("--easy_matches", type=int, default=50)
     parser.add_argument("--hard_matches", type=int, default=50)
+    parser.add_argument("--eval_workers", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--stage_name",
@@ -378,6 +521,7 @@ if __name__ == "__main__":
             seed_base=args.seed,
             stage_name=args.stage_name,
             suite_name=args.suite,
+            eval_workers=args.eval_workers,
         )
     else:
         stats = run_match(
@@ -387,5 +531,6 @@ if __name__ == "__main__":
             args.seed,
             args.stage_name,
             suite_name=args.suite,
+            eval_workers=args.eval_workers,
         )
         print_pool_summary(args.pool, stats)

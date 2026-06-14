@@ -303,6 +303,9 @@ ITEM_REWARD_COMMON = {
     "r_duel_safe_item_pressure": 0.015,
     "r_duel_item_stall": -0.015,
     "r_duel_commit_enemy_bonus": 0.08,
+    "r_survive_to_top3": 0.10,
+    "r_survive_to_top2": 0.28,
+    "timeout_rank_rewards": {0: 0.18, 1: 0.06, 2: -0.06, 3: -0.18},
 }
 
 RESOURCE_CONTROL_END_STEP = 1_500_000
@@ -332,7 +335,7 @@ CURRICULUM_STAGES = [
             "r_valuable_bomb_box": 0.05,
             "r_useless_bomb": -0.12,
             "r_no_escape_bomb": -0.60,
-            "rank_rewards": {0: 0.8, 1: 0.15, 2: -0.15, 3: -0.6},
+            "rank_rewards": {0: 0.8, 1: 0.20, 2: -0.20, 3: -0.7},
             "r_move_closer_bomb_spot": 0.004,
             "r_move_away_bomb_spot": -0.0015,
             "r_best_bomb_spot_dist": 0.012,
@@ -363,7 +366,7 @@ CURRICULUM_STAGES = [
             "r_valuable_bomb_box": 0.045,
             "r_useless_bomb": -0.12,
             "r_no_escape_bomb": -0.65,
-            "rank_rewards": {0: 1.2, 1: 0.25, 2: -0.25, 3: -1.0},
+            "rank_rewards": {0: 1.2, 1: 0.30, 2: -0.30, 3: -1.1},
             "r_move_closer_bomb_spot": 0.001,
             "r_move_away_bomb_spot": -0.0005,
             "r_best_bomb_spot_dist": 0.004,
@@ -394,7 +397,7 @@ CURRICULUM_STAGES = [
             "r_valuable_bomb_box": 0.035,
             "r_useless_bomb": -0.14,
             "r_no_escape_bomb": -0.85,
-            "rank_rewards": {0: 1.3, 1: 0.30, 2: -0.35, 3: -1.4},
+            "rank_rewards": {0: 1.3, 1: 0.38, 2: -0.42, 3: -1.5},
             "r_move_closer_bomb_spot": 0.0005,
             "r_move_away_bomb_spot": -0.0005,
             "r_best_bomb_spot_dist": 0.002,
@@ -425,7 +428,7 @@ CURRICULUM_STAGES = [
             "r_valuable_bomb_box": 0.035,
             "r_useless_bomb": -0.12,
             "r_no_escape_bomb": -0.70,
-            "rank_rewards": {0: 1.8, 1: 0.40, 2: -0.50, 3: -1.8},
+            "rank_rewards": {0: 1.8, 1: 0.55, 2: -0.65, 3: -1.95},
             "r_move_closer_bomb_spot": 0.001,
             "r_move_away_bomb_spot": -0.0005,
             "r_best_bomb_spot_dist": 0.004,
@@ -456,7 +459,7 @@ CURRICULUM_STAGES = [
             "r_valuable_bomb_box": 0.04,
             "r_useless_bomb": -0.12,
             "r_no_escape_bomb": -0.70,
-            "rank_rewards": {0: 2.0, 1: 0.45, 2: -0.55, 3: -2.0},
+            "rank_rewards": {0: 2.0, 1: 0.70, 2: -0.80, 3: -2.15},
             "r_move_closer_bomb_spot": 0.001,
             "r_move_away_bomb_spot": -0.0005,
             "r_best_bomb_spot_dist": 0.004,
@@ -465,7 +468,7 @@ CURRICULUM_STAGES = [
             "ffa_reward_add": {
                 "r_kill": -0.45,
                 "r_move_closer": -0.0004,
-                "r_move_away": +0.0002,
+                "r_move_away": +0.0006,
                 "r_best_enemy_dist": -0.0030,
                 "r_danger_critical": -0.05,
                 "r_danger_soon": -0.03,
@@ -474,6 +477,8 @@ CURRICULUM_STAGES = [
                 "r_item_collect": +0.02,
                 "r_item_capacity": +0.04,
                 "r_item_radius": +0.04,
+                "tiebreak_box_diff_coef": +0.02,
+                "tiebreak_item_diff_coef": +0.03,
             },
             "duel_reward_add": {
                 "r_kill": +0.55,
@@ -487,8 +492,8 @@ CURRICULUM_STAGES = [
                 "tiebreak_kill_diff_coef": +0.03,
             },
             "late_step_reward_add": {
-                "tiebreak_box_diff_coef": +0.02,
-                "tiebreak_item_diff_coef": +0.02,
+                "tiebreak_box_diff_coef": +0.03,
+                "tiebreak_item_diff_coef": +0.04,
             },
             **ITEM_REWARD_COMMON,
         },
@@ -516,7 +521,7 @@ CURRICULUM_STAGES = [
             "r_valuable_bomb_box": 0.03,
             "r_useless_bomb": -0.13,
             "r_no_escape_bomb": -0.72,
-            "rank_rewards": {0: 2.2, 1: 0.55, 2: -0.55, 3: -2.1},
+            "rank_rewards": {0: 2.2, 1: 0.85, 2: -0.85, 3: -2.3},
             "r_move_closer_bomb_spot": 0.0007,
             "r_move_away_bomb_spot": -0.0004,
             "r_best_bomb_spot_dist": 0.003,
@@ -525,7 +530,7 @@ CURRICULUM_STAGES = [
             "ffa_reward_add": {
                 "r_kill": -0.70,
                 "r_move_closer": -0.0005,
-                "r_move_away": +0.0002,
+                "r_move_away": +0.0007,
                 "r_best_enemy_dist": -0.0020,
                 "r_danger_critical": -0.05,
                 "r_danger_soon": -0.03,
@@ -534,6 +539,8 @@ CURRICULUM_STAGES = [
                 "r_item_collect": +0.01,
                 "r_item_capacity": +0.03,
                 "r_item_radius": +0.03,
+                "tiebreak_box_diff_coef": +0.03,
+                "tiebreak_item_diff_coef": +0.04,
             },
             "duel_reward_add": {
                 "r_kill": +0.80,
@@ -547,8 +554,9 @@ CURRICULUM_STAGES = [
                 "tiebreak_box_diff_coef": -0.02,
             },
             "late_step_reward_add": {
-                "tiebreak_kill_diff_coef": +0.02,
-                "tiebreak_box_diff_coef": +0.02,
+                "tiebreak_kill_diff_coef": +0.03,
+                "tiebreak_box_diff_coef": +0.04,
+                "tiebreak_item_diff_coef": +0.04,
             },
             **ITEM_REWARD_COMMON,
         },
@@ -576,7 +584,7 @@ CURRICULUM_STAGES = [
             "r_valuable_bomb_box": 0.035,
             "r_useless_bomb": -0.12,
             "r_no_escape_bomb": -0.70,
-            "rank_rewards": {0: 2.2, 1: 0.50, 2: -0.60, 3: -2.2},
+            "rank_rewards": {0: 2.2, 1: 0.80, 2: -0.90, 3: -2.4},
             "r_move_closer_bomb_spot": 0.001,
             "r_move_away_bomb_spot": -0.0005,
             "r_best_bomb_spot_dist": 0.004,
@@ -585,7 +593,7 @@ CURRICULUM_STAGES = [
             "ffa_reward_add": {
                 "r_kill": -0.55,
                 "r_move_closer": -0.0004,
-                "r_move_away": +0.0002,
+                "r_move_away": +0.0006,
                 "r_best_enemy_dist": -0.0025,
                 "r_danger_critical": -0.04,
                 "r_danger_soon": -0.02,
@@ -594,6 +602,8 @@ CURRICULUM_STAGES = [
                 "r_item_collect": +0.01,
                 "r_item_capacity": +0.03,
                 "r_item_radius": +0.03,
+                "tiebreak_box_diff_coef": +0.03,
+                "tiebreak_item_diff_coef": +0.03,
             },
             "duel_reward_add": {
                 "r_kill": +0.65,
@@ -606,8 +616,9 @@ CURRICULUM_STAGES = [
                 "tiebreak_item_diff_coef": -0.02,
             },
             "late_step_reward_add": {
-                "tiebreak_kill_diff_coef": +0.02,
-                "tiebreak_box_diff_coef": +0.02,
+                "tiebreak_kill_diff_coef": +0.03,
+                "tiebreak_box_diff_coef": +0.04,
+                "tiebreak_item_diff_coef": +0.03,
             },
             **ITEM_REWARD_COMMON,
         },
@@ -966,6 +977,8 @@ def make_episode_context(obs: dict, agent_id: int) -> dict:
         "duel_stall_steps": 0,
         "duel_item_stall_events": 0,
         "duel_commit_bomb_events": 0,
+        "survived_to_top3": 0,
+        "survived_to_top2": 0,
         "visited_tiles": {(start_row, start_col)},
         "repeat_steps": 0,
         "recent_positions": recent_positions,
@@ -996,6 +1009,8 @@ def summarize_episode_metrics(episode_ctx: dict, final_stats: dict) -> dict:
             "duel_stall_steps": float(episode_ctx.get("duel_stall_steps", 0)),
             "duel_item_stall_events": float(episode_ctx.get("duel_item_stall_events", 0)),
             "duel_commit_bomb_events": float(episode_ctx.get("duel_commit_bomb_events", 0)),
+            "survived_to_top3": float(episode_ctx.get("survived_to_top3", 0)),
+            "survived_to_top2": float(episode_ctx.get("survived_to_top2", 0)),
         }
     )
     return metrics
@@ -1017,12 +1032,21 @@ def compute_reward(
     current_step: int | None = None,
 ):
     alive_count = len(alive_agent_ids(obs))
+    prev_alive_count = len(alive_agent_ids(prev_obs))
     reward_cfg = effective_reward_cfg(stage, alive_count, current_step)
     reward = reward_cfg["step_penalty"]
 
     was_alive = bool(prev_obs["players"][agent_id][2])
-    if was_alive and not bool(obs["players"][agent_id][2]):
+    is_alive = bool(obs["players"][agent_id][2])
+    if was_alive and not is_alive:
         reward += reward_cfg["r_death"]
+    elif was_alive and is_alive and alive_count < prev_alive_count:
+        if alive_count == 3 and not episode_ctx.get("survived_to_top3", 0):
+            reward += reward_cfg.get("r_survive_to_top3", 0.0)
+            episode_ctx["survived_to_top3"] = 1
+        if alive_count == 2 and not episode_ctx.get("survived_to_top2", 0):
+            reward += reward_cfg.get("r_survive_to_top2", 0.0)
+            episode_ctx["survived_to_top2"] = 1
 
     reward += (curr_stats["kills"] - prev_stats["kills"]) * reward_cfg["r_kill"]
     reward += (curr_stats["boxes"] - prev_stats["boxes"]) * reward_cfg["r_box_destroy"]
@@ -1242,6 +1266,8 @@ def compute_reward(
                 )
 
     if done and rank is not None:
+        if current_step is not None and int(current_step) >= 500:
+            reward += reward_cfg.get("timeout_rank_rewards", {}).get(rank, 0.0)
         reward += reward_cfg["rank_rewards"].get(rank, 0.0)
 
     return float(np.clip(reward, -CFG["reward_clip"], CFG["reward_clip"]))

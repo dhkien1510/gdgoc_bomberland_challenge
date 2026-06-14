@@ -47,3 +47,22 @@ These raw folders are not treated as stable runtime targets. Promote a checkpoin
    - copy it into `runtime_local/model.pth`
 5. If you want it as the new submission:
    - copy it into `submission/model.pth`
+
+
+python agent/agent/v6_1/eval_ppo_legacy.py `
+  --checkpoint agent/agent/v6_1/checkpoint_bank/submission_latest/model_step1356800.pth `
+  --pool suite `
+  --suite legacy `
+  --easy_matches 50 `
+  --hard_matches 50 `
+  --seed 42 `
+  --stage_name resource_control
+
+  python agent/agent/v6_1/eval_ppo_legacy.py `
+  --checkpoint agent/agent/v6_1/checkpoint_bank/submission_latest/model_step1356800.pth `
+  --pool suite `
+  --suite v6hard `
+  --easy_matches 50 `
+  --hard_matches 50 `
+  --seed 42 `
+  --stage_name resource_control
